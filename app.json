@@ -27,6 +27,7 @@
         "backgroundColor": "#FFFFFF"
       },
       "package": "com.emz.app",
+      "minSdkVersion": 26,
       "permissions": [
         "android.permission.health.READ_SLEEP",
         "android.permission.health.READ_HEART_RATE",
