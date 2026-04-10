@@ -44,6 +44,14 @@
       "@react-native-community/datetimepicker",
       "expo-calendar",
       [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
+        }
+      ],
+      [
         "react-native-health-connect",
         {
           "package": "com.emz.app"
