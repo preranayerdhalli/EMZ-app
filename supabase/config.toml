@@ -1,0 +1,56 @@
+# Supabase project configuration
+# Used by the Supabase CLI for local development and deployment
+# Run: supabase link --project-ref your-project-ref
+
+[api]
+# Port to use for the local API (supabase start)
+port = 54321
+
+[db]
+# PostgreSQL port for local development
+port = 54322
+
+[studio]
+# Supabase Studio port
+port = 54323
+
+[auth]
+# Email OTP (magic link) is enabled by default in Supabase Auth
+# Enable in Dashboard: Authentication → Providers → Email → Enable → Confirm email
+
+# Google OAuth
+# Dashboard: Authentication → Providers → Google
+# Requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET from Google Cloud Console
+
+# Apple Sign In
+# Dashboard: Authentication → Providers → Apple
+# Requires Apple Developer account (iOS only)
+
+[functions]
+# Edge Functions are deployed to the Supabase cloud
+# Deploy all: supabase functions deploy
+# Deploy one:  supabase functions deploy health-sync
+#
+# Set secrets (required before deploying calendar sync functions):
+#   supabase secrets set GOOGLE_CLIENT_ID=...
+#   supabase secrets set GOOGLE_CLIENT_SECRET=...
+#   supabase secrets set MICROSOFT_CLIENT_ID=...
+#   supabase secrets set MICROSOFT_CLIENT_SECRET=...
+
+# ─── Setup checklist ──────────────────────────────────────────────────────────
+# 1. Create Supabase project at https://supabase.com/dashboard
+# 2. Run SQL migrations in order (SQL Editor → New query → paste → Run):
+#    - supabase/migrations/001_users.sql
+#    - supabase/migrations/002_biometrics.sql
+#    - supabase/migrations/003_energy_forecasts.sql
+#    - supabase/migrations/004_calendar.sql
+#    - supabase/migrations/005_tasks.sql
+#    - supabase/migrations/006_mood_summaries.sql
+# 3. Enable Auth providers in Dashboard
+# 4. Copy Project URL + anon key to .env (based on .env.example)
+# 5. Run: supabase link --project-ref your-project-ref
+# 6. Set edge function secrets (see [functions] section above)
+# 7. Run: supabase functions deploy
+# 8. Add EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY to .env
+# 9. Run: npx expo prebuild (required for native health SDKs)
+# 10. Run: npx expo run:ios  OR  npx expo run:android

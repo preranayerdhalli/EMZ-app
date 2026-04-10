@@ -1,0 +1,59 @@
+{
+  "expo": {
+    "name": "emz",
+    "slug": "emz",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/logo.png",
+    "scheme": "emz",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#FFFFFF"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.emz.app",
+      "infoPlist": {
+        "NSHealthShareUsageDescription": "EMZ reads your health data to calculate your energy levels and recovery.",
+        "NSHealthUpdateUsageDescription": "EMZ reads your health data to calculate your energy levels and recovery."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/logo.png",
+        "backgroundColor": "#FFFFFF"
+      },
+      "package": "com.emz.app",
+      "permissions": [
+        "android.permission.health.READ_SLEEP",
+        "android.permission.health.READ_HEART_RATE",
+        "android.permission.health.READ_HEART_RATE_VARIABILITY",
+        "android.permission.health.READ_RESTING_HEART_RATE",
+        "android.permission.health.READ_MENSTRUATION",
+        "android.permission.health.READ_EXERCISE"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-asset",
+      "expo-font",
+      "@react-native-community/datetimepicker",
+      "expo-calendar",
+      [
+        "react-native-health-connect",
+        {
+          "package": "com.emz.app"
+        }
+      ]
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "41758019-aa72-463b-98f6-486fc2634967"
+      }
+    }
+  }
+}
