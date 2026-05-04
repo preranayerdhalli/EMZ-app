@@ -14,12 +14,14 @@ export interface HourlyEnergyData {
  */
 export function useEnergy(date: string): {
   energyByHour: Record<number, HourlyEnergyData>;
+  hasData: boolean;
   loading: boolean;
 } {
   const { user } = useAuth();
   const [energyByHour, setEnergyByHour] = useState<Record<number, HourlyEnergyData>>(
     buildFallback(),
   );
+  const [hasData, setHasData] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -41,13 +43,14 @@ export function useEnergy(date: string): {
             };
           });
           setEnergyByHour(map);
+          setHasData(true);
         }
         // If no data yet, keep fallback values
         setLoading(false);
       });
   }, [user, date]);
 
-  return { energyByHour, loading };
+  return { energyByHour, hasData, loading };
 }
 
 /** Moderate fallback used before first health sync */

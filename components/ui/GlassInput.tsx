@@ -1,3 +1,4 @@
+import { type TextInputProps } from 'react-native';
 import { TextField } from '@/components/ui/TextField';
 
 type GlassInputProps = {
@@ -5,9 +6,10 @@ type GlassInputProps = {
   placeholder?: string;
   value: string;
   onChangeText: (t: string) => void;
-  autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
-  keyboardType?: 'default' | 'email-address';
-  autoComplete?: string;
+  autoCapitalize?: TextInputProps['autoCapitalize'];
+  keyboardType?: TextInputProps['keyboardType'];
+  autoComplete?: TextInputProps['autoComplete'];
+  editable?: boolean;
 };
 
 export function GlassInput({
@@ -18,6 +20,7 @@ export function GlassInput({
   autoCapitalize = 'none',
   keyboardType = 'email-address',
   autoComplete,
+  editable,
 }: GlassInputProps) {
   return (
     <TextField
@@ -28,6 +31,7 @@ export function GlassInput({
       autoCapitalize={autoCapitalize}
       keyboardType={keyboardType}
       autoComplete={autoComplete}
+      editable={editable}
       accessibilityLabel={label}
     />
   );

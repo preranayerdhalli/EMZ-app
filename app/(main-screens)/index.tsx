@@ -24,10 +24,13 @@ import { useCalendarItems } from '@/hooks/useCalendarItems';
 import { useEnergy } from '@/hooks/useEnergy';
 import { useWeeklyStats, getWeekMonday } from '@/hooks/useWeeklyStats';
 import { useDailySummary } from '@/hooks/useDailySummary';
+import type { SummaryFeedback } from '@/hooks/useDailySummary';
 import { useMoodCheckin } from '@/hooks/useMoodCheckin';
 import { colors, spacing, borderRadius, typography, fonts, palette } from '@/constants/theme';
 import { Card } from '@/components/ui';
-import type { CalendarItem, TaskBlock } from '@/constants/calendarTypes';
+import type { CalendarItem } from '@/constants/calendarTypes';
+import { useAuth } from '@/context/AuthContext';
+import { usePostHog } from 'posthog-react-native';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -36,11 +39,6 @@ if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental
 const TAB_BAR_HEIGHT = 64;
 const BEE_AREA_HEIGHT = 112;
 
-// ─── Work type buckets ────────────────────────────────────────────────────────
-// Main Focus: high-intensity, requires concentration
-const MAIN_FOCUS_TYPES = new Set(['deep', 'creative', 'learning']);
-// Nice to do: lighter, flexible, restorative
-const NICE_TO_DO_TYPES = new Set(['recovery', 'admin', 'chore', 'social']);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -58,13 +56,6 @@ function getCapacity(taskCount: number, meetingMinutes: number): number {
   return Math.max(1, Math.round(taskCount * 0.6));
 }
 
-function getDaySummary(taskCount: number, meetingMinutes: number, capacity: number): string {
-  const meetingHours = Math.round(meetingMinutes / 60);
-  const meetingStr = meetingHours === 1 ? '1 hour' : `${meetingHours} hours`;
-  const taskStr = taskCount === 1 ? '1 task' : `${taskCount} tasks`;
-  return `You have ${taskStr} and ${meetingStr} of meetings today, based on your recovery, you can handle ${capacity} well.`;
-}
-
 
 function getTodayStr(): string {
   return new Date().toISOString().slice(0, 10);
@@ -79,63 +70,6 @@ function formatDate(): string {
 const TEXT_PRIMARY = colors.ink.primary;
 const TEXT_SECONDARY = colors.ink.secondary;
 const TEXT_TERTIARY = colors.ink.tertiary;
-
-// ─── Suggested schedule (from suggested calendar, not raw Google) ───────────────
-
-/** Build suggested task blocks for the day: same tasks, suggested times in gaps / order. */
-function getSuggestedTasksForDay(dayItems: CalendarItem[]): TaskBlock[] {
-  const events = dayItems
-    .filter((i): i is CalendarItem & { type: 'event' } => i.type === 'event')
-    .map((i) => i.data);
-  const incompleteTasks = dayItems
-    .filter((i): i is CalendarItem & { type: 'task' } => i.type === 'task')
-    .map((i) => i.data)
-    .filter((t) => !t.completed);
-  if (incompleteTasks.length === 0) return [];
-
-  const DAY_START = 7 * 60;
-  const DAY_END = 21 * 60;
-  const eventBlocks = [...events]
-    .sort((a, b) => a.startMinutes - b.startMinutes)
-    .map((e) => ({ start: e.startMinutes, end: e.endMinutes }));
-
-  const gaps: { start: number; end: number }[] = [];
-  let prevEnd = DAY_START;
-  for (const b of eventBlocks) {
-    if (b.start > prevEnd && b.start - prevEnd >= 15) {
-      gaps.push({ start: prevEnd, end: b.start });
-    }
-    prevEnd = Math.max(prevEnd, b.end);
-  }
-  if (DAY_END > prevEnd) gaps.push({ start: prevEnd, end: DAY_END });
-
-  const sortForSuggested = (a: TaskBlock, b: TaskBlock) => {
-    if (a.priority === 'high' && b.priority !== 'high') return -1;
-    if (a.priority !== 'high' && b.priority === 'high') return 1;
-    const aMain = MAIN_FOCUS_TYPES.has(a.workType) ? 0 : NICE_TO_DO_TYPES.has(a.workType) ? 1 : 0;
-    const bMain = MAIN_FOCUS_TYPES.has(b.workType) ? 0 : NICE_TO_DO_TYPES.has(b.workType) ? 1 : 0;
-    if (aMain !== bMain) return aMain - bMain;
-    if (a.workType === 'recovery' && b.workType !== 'recovery') return -1;
-    if (a.workType !== 'recovery' && b.workType === 'recovery') return 1;
-    return a.startMinutes - b.startMinutes;
-  };
-
-  const sorted = [...incompleteTasks].sort(sortForSuggested);
-  const gapCopy = gaps.map((g) => ({ ...g, cursor: g.start }));
-
-  const suggested: TaskBlock[] = [];
-  for (const task of sorted) {
-    const duration = task.endMinutes - task.startMinutes;
-    const gap = gapCopy.find((g) => g.end - g.cursor >= duration);
-    if (!gap) continue;
-    const start = gap.cursor;
-    const end = start + duration;
-    gap.cursor = end;
-    suggested.push({ ...task, startMinutes: start, endMinutes: end });
-  }
-
-  return suggested.sort((a, b) => a.startMinutes - b.startMinutes);
-}
 
 /** Find up to `count` free-gap start times (in minutes since midnight) that are
  *  ≥ minDuration minutes long and start at or after `afterMinutes`. */
@@ -189,28 +123,12 @@ function useTodayData() {
 
     const meetingMinutes = events.reduce((sum, e) => sum + (e.endMinutes - e.startMinutes), 0);
 
-    // Main Focus and Nice to do from suggested schedule (times/order), not raw Google calendar
-    const suggestedTasks = getSuggestedTasksForDay(dayItems);
-
-    const mainFocusTasks = suggestedTasks
-      .filter((t) => MAIN_FOCUS_TYPES.has(t.workType))
-      .slice(0, 3);
-
-    const unclassified = suggestedTasks.filter(
-      (t) => !MAIN_FOCUS_TYPES.has(t.workType) && !NICE_TO_DO_TYPES.has(t.workType)
-    );
-    const mainFocusFinal = [...mainFocusTasks, ...unclassified].slice(0, 3);
-
-    const recoveryMomentsTasks = suggestedTasks.filter((t) => t.workType === 'recovery');
-
     const now = new Date();
     const nowMinutes = now.getHours() * 60 + now.getMinutes();
     const rechargeSlots = getRechargeSlots(events, nowMinutes, 5, 2);
 
     return {
       meetingMinutes,
-      mainFocusTasks: mainFocusFinal,
-      recoveryMomentsTasks,
       allIncompleteCount: incompleteTasks.length,
       rechargeSlots,
     };
@@ -248,6 +166,7 @@ const MOODS = ['😄', '🙂', '😐', '😕', '😔', '😢'] as const;
 
 function MoodCheckIn() {
   const { saveCheckin } = useMoodCheckin();
+  const posthog = usePostHog();
   const [selectedMood, setSelectedMood] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [text, setText] = useState('');
@@ -271,6 +190,10 @@ function MoodCheckIn() {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
     // Save to backend when user dismisses (fire-and-forget)
     if (selectedMood || text.trim()) {
+      posthog?.capture('mood_checkin_saved', {
+        mood_emoji: selectedMood,
+        has_notes: text.trim().length > 0,
+      });
       saveCheckin({
         date: getTodayStr(),
         moodEmoji: selectedMood,
@@ -357,28 +280,57 @@ function MoodCheckIn() {
   );
 }
 
-// ─── Daily Summary Card ───────────────────────────────────────────────────────
+// ─── Daily Summary Card ───────────────────────────────��───────────────────────
 
-function DailySummaryCard({ summary }: { summary: string }) {
+function DailySummaryCard({
+  summary,
+  feedback,
+  onFeedback,
+}: {
+  summary: string;
+  feedback: SummaryFeedback | null;
+  onFeedback: (v: SummaryFeedback) => void;
+}) {
   return (
-    <View style={dscStyles.card}>
+    <Card variant="card" inset={false} style={{ marginBottom: 20 }}>
+      <View style={dscStyles.inner}>
       <View style={dscStyles.headingRow}>
         <Ionicons name="sunny-outline" size={13} color={TEXT_TERTIARY} style={{ marginTop: 1 }} />
         <Text style={dscStyles.heading}>Daily Summary</Text>
+        <View style={dscStyles.feedbackRow}>
+          <Pressable
+            onPress={() => onFeedback('up')}
+            hitSlop={8}
+            style={[dscStyles.feedbackBtn, feedback === 'up' && dscStyles.feedbackBtnActive]}
+          >
+            <Ionicons
+              name={feedback === 'up' ? 'thumbs-up' : 'thumbs-up-outline'}
+              size={14}
+              color={feedback === 'up' ? palette.accentOrange : TEXT_TERTIARY}
+            />
+          </Pressable>
+          <Pressable
+            onPress={() => onFeedback('down')}
+            hitSlop={8}
+            style={[dscStyles.feedbackBtn, feedback === 'down' && dscStyles.feedbackBtnActive]}
+          >
+            <Ionicons
+              name={feedback === 'down' ? 'thumbs-down' : 'thumbs-down-outline'}
+              size={14}
+              color={feedback === 'down' ? colors.ink.secondary : TEXT_TERTIARY}
+            />
+          </Pressable>
+        </View>
       </View>
       <Text style={dscStyles.body}>{summary}</Text>
-    </View>
+      </View>
+    </Card>
   );
 }
 
 const dscStyles = StyleSheet.create({
-  card: {
-    backgroundColor: colors.surface.card,
-    borderRadius: borderRadius.card,
+  inner: {
     padding: 14,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.surface.cardBorder,
-    marginBottom: 20,
   },
   headingRow: {
     flexDirection: 'row',
@@ -393,6 +345,18 @@ const dscStyles = StyleSheet.create({
     color: TEXT_TERTIARY,
     letterSpacing: 0.4,
     textTransform: 'uppercase',
+    flex: 1,
+  },
+  feedbackRow: {
+    flexDirection: 'row',
+    gap: 4,
+  },
+  feedbackBtn: {
+    padding: 4,
+    borderRadius: 6,
+  },
+  feedbackBtnActive: {
+    backgroundColor: 'rgba(255,132,0,0.10)',
   },
   body: {
     fontSize: typography.body.fontSize,
@@ -531,7 +495,7 @@ function WorkloadLine({ data, chartWidth }: { data: WeekDay[]; chartWidth: numbe
 
 // ─── Progress card ────────────────────────────────────────────────────────────
 
-function ProgressCard() {
+function ProgressCard({ isEmpty }: { isEmpty: boolean }) {
   const { weekData } = useWeeklyStats(getWeekMonday());
   const insight = getWeekInsight(weekData);
   const [selectedDay, setSelectedDay] = useState<number | null>(null);
@@ -545,26 +509,40 @@ function ProgressCard() {
   const analysis = selectedDay !== null ? getDayAnalysis(weekData[selectedDay]) : null;
 
   return (
-    <View style={progressStyles.card}>
+    <Card variant="card" inset={false} style={{ marginBottom: 20 }}>
+    <View style={progressStyles.inner}>
       {/* Header */}
-      <View style={progressStyles.headingRow}>
+      <View style={progressStyles.headingBlock}>
         <View style={progressStyles.headingLeft}>
           <Ionicons name="bar-chart-outline" size={13} color={TEXT_TERTIARY} style={{ marginTop: 1 }} />
           <Text style={progressStyles.heading}>This Week</Text>
         </View>
-        {/* Legend */}
-        <View style={progressStyles.legendRow}>
-          <View style={progressStyles.legendLine} />
-          <Text style={progressStyles.legendText}>Workload</Text>
-          <View style={[progressStyles.legendDot, { backgroundColor: COLOR_BODY_BATTERY }]} />
-          <Text style={progressStyles.legendText}>Body Battery</Text>
-          <View style={[progressStyles.legendDot, { backgroundColor: COLOR_RECOVERY }]} />
-          <Text style={progressStyles.legendText}>Recovery</Text>
-        </View>
+        {/* Legend — shown only when data is available */}
+        {!isEmpty && (
+          <View style={progressStyles.legendRow}>
+            <View style={progressStyles.legendLine} />
+            <Text style={progressStyles.legendText}>Workload</Text>
+            <View style={[progressStyles.legendDot, { backgroundColor: COLOR_BODY_BATTERY }]} />
+            <Text style={progressStyles.legendText}>Body Battery</Text>
+            <View style={[progressStyles.legendDot, { backgroundColor: COLOR_RECOVERY }]} />
+            <Text style={progressStyles.legendText}>Recovery</Text>
+          </View>
+        )}
       </View>
 
+      {/* Gathering data state */}
+      {isEmpty && (
+        <View style={progressStyles.gatheringWrap}>
+          <Ionicons name="time-outline" size={20} color={TEXT_TERTIARY} />
+          <Text style={progressStyles.gatheringTitle}>Gathering data</Text>
+          <Text style={progressStyles.gatheringBody}>
+            Your weekly summary will be ready once health and task data starts syncing.
+          </Text>
+        </View>
+      )}
+
       {/* Chart — bar columns + workload line overlay */}
-      <View
+      {!isEmpty && <View
         onLayout={(e) => setChartWidth(e.nativeEvent.layout.width)}
         style={{ position: 'relative' }}
       >
@@ -595,71 +573,68 @@ function ProgressCard() {
           })}
         </View>
         <WorkloadLine data={weekData} chartWidth={chartWidth} />
-      </View>
+      </View>}
 
-      {/* Tap hint */}
-      {selectedDay === null && (
-        <Text style={progressStyles.tapHint}>Tap a day for details</Text>
-      )}
+      {!isEmpty && <>
+        {/* Tap hint */}
+        {selectedDay === null && (
+          <Text style={progressStyles.tapHint}>Tap a day for details</Text>
+        )}
 
-      {/* Day detail panel */}
-      {analysis !== null && selectedDay !== null && (
-        <View style={progressStyles.dayDetail}>
-          <View style={progressStyles.dayDetailHeader}>
-            <Text style={progressStyles.dayDetailDay}>{weekData[selectedDay].day}</Text>
-            <Pressable onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setSelectedDay(null); }} hitSlop={10}>
-              <Ionicons name="close" size={14} color={TEXT_TERTIARY} />
-            </Pressable>
+        {/* Day detail panel */}
+        {analysis !== null && selectedDay !== null && (
+          <View style={progressStyles.dayDetail}>
+            <View style={progressStyles.dayDetailHeader}>
+              <Text style={progressStyles.dayDetailDay}>{weekData[selectedDay].day}</Text>
+              <Pressable onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setSelectedDay(null); }} hitSlop={10}>
+                <Ionicons name="close" size={14} color={TEXT_TERTIARY} />
+              </Pressable>
+            </View>
+            <View style={progressStyles.dayDetailStats}>
+              <View style={progressStyles.dayDetailStat}>
+                <View style={[progressStyles.dayDetailDot, { backgroundColor: COLOR_BODY_BATTERY }]} />
+                <Text style={progressStyles.dayDetailLabel}>Body Battery</Text>
+                <Text style={progressStyles.dayDetailVal}>{analysis.battPct}% · {analysis.battLabel}</Text>
+              </View>
+              <View style={progressStyles.dayDetailStat}>
+                <View style={[progressStyles.dayDetailDot, { backgroundColor: COLOR_RECOVERY }]} />
+                <Text style={progressStyles.dayDetailLabel}>Recovery</Text>
+                <Text style={progressStyles.dayDetailVal}>{analysis.recPct}% · {analysis.recLabel}</Text>
+              </View>
+              <View style={progressStyles.dayDetailStat}>
+                <View style={[progressStyles.dayDetailDot, { backgroundColor: COLOR_WORKLOAD }]} />
+                <Text style={progressStyles.dayDetailLabel}>Workload</Text>
+                <Text style={progressStyles.dayDetailVal}>{analysis.loadPct}% · {analysis.loadLabel}</Text>
+              </View>
+            </View>
+            <View style={progressStyles.dayDetailSummaryRow}>
+              <Ionicons name="sparkles" size={11} color={TEXT_TERTIARY} style={{ marginTop: 1 }} />
+              <Text style={progressStyles.dayDetailSummary}>{analysis.summary}</Text>
+            </View>
           </View>
-          <View style={progressStyles.dayDetailStats}>
-            <View style={progressStyles.dayDetailStat}>
-              <View style={[progressStyles.dayDetailDot, { backgroundColor: COLOR_BODY_BATTERY }]} />
-              <Text style={progressStyles.dayDetailLabel}>Body Battery</Text>
-              <Text style={progressStyles.dayDetailVal}>{analysis.battPct}% · {analysis.battLabel}</Text>
-            </View>
-            <View style={progressStyles.dayDetailStat}>
-              <View style={[progressStyles.dayDetailDot, { backgroundColor: COLOR_RECOVERY }]} />
-              <Text style={progressStyles.dayDetailLabel}>Recovery</Text>
-              <Text style={progressStyles.dayDetailVal}>{analysis.recPct}% · {analysis.recLabel}</Text>
-            </View>
-            <View style={progressStyles.dayDetailStat}>
-              <View style={[progressStyles.dayDetailDot, { backgroundColor: COLOR_WORKLOAD }]} />
-              <Text style={progressStyles.dayDetailLabel}>Workload</Text>
-              <Text style={progressStyles.dayDetailVal}>{analysis.loadPct}% · {analysis.loadLabel}</Text>
-            </View>
-          </View>
-          <View style={progressStyles.dayDetailSummaryRow}>
+        )}
+
+        {/* Week insight (hidden while a day is selected) */}
+        {selectedDay === null && (
+          <View style={progressStyles.insightRow}>
             <Ionicons name="sparkles" size={11} color={TEXT_TERTIARY} style={{ marginTop: 1 }} />
-            <Text style={progressStyles.dayDetailSummary}>{analysis.summary}</Text>
+            <Text style={progressStyles.insightText}>{insight}</Text>
           </View>
-        </View>
-      )}
-
-      {/* Week insight (hidden while a day is selected) */}
-      {selectedDay === null && (
-        <View style={progressStyles.insightRow}>
-          <Ionicons name="sparkles" size={11} color={TEXT_TERTIARY} style={{ marginTop: 1 }} />
-          <Text style={progressStyles.insightText}>{insight}</Text>
-        </View>
-      )}
+        )}
+      </>}
     </View>
+    </Card>
   );
 }
 
 const progressStyles = StyleSheet.create({
-  card: {
-    backgroundColor: colors.surface.card,
-    borderRadius: borderRadius.card,
+  inner: {
     padding: 14,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.surface.cardBorder,
-    marginBottom: 20,
   },
-  headingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+  headingBlock: {
+    flexDirection: 'column',
     marginBottom: 14,
+    gap: 8,
   },
   headingLeft: {
     flexDirection: 'row',
@@ -818,6 +793,25 @@ const progressStyles = StyleSheet.create({
     color: TEXT_SECONDARY,
     lineHeight: 17,
   },
+  gatheringWrap: {
+    alignItems: 'center',
+    paddingVertical: 24,
+    gap: 8,
+  },
+  gatheringTitle: {
+    fontSize: typography.cardTitle.fontSize,
+    lineHeight: typography.cardTitle.lineHeight,
+    fontFamily: fonts.bodyMedium,
+    color: TEXT_SECONDARY,
+  },
+  gatheringBody: {
+    fontSize: 13,
+    fontFamily: fonts.bodyLight,
+    color: TEXT_TERTIARY,
+    textAlign: 'center',
+    lineHeight: 18,
+    paddingHorizontal: 12,
+  },
 });
 
 // ─── Home screen ──────────────────────────────────────────────────────────────
@@ -825,13 +819,19 @@ const progressStyles = StyleSheet.create({
 export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const { user } = useAuth();
   const [animationOpen, setAnimationOpen] = useState(false);
-  const [profileName] = useState('Pre');
+
+  const profileName = (() => {
+    const meta = user?.user_metadata as Record<string, unknown> | undefined;
+    const full = (meta?.full_name ?? meta?.name ?? '') as string;
+    return full.trim() || (user?.email ?? '').split('@')[0] || 'You';
+  })();
 
   const today = getTodayStr();
   const { meetingMinutes, allIncompleteCount, rechargeSlots } = useTodayData();
   const { energyByHour } = useEnergy(today);
-  const { summary: dailySummaryData } = useDailySummary(today);
+  const { summary: dailySummaryData, submitFeedback } = useDailySummary(today);
   const capacity = getCapacity(allIncompleteCount, meetingMinutes);
 
   // Use micro-break hours from energy forecast as recharge slots when available
@@ -844,8 +844,7 @@ export default function HomeScreen() {
 
   const bottomPadding = insets.bottom + TAB_BAR_HEIGHT + BEE_AREA_HEIGHT + spacing.md;
 
-  // 5 animated slots: header, metrics, moodCheckIn, mainFocus, recoveryMoments
-  const entranceAnims = useEntranceAnims(6);
+  const entranceAnims = useEntranceAnims(5);
 
   const entranceStyle = (index: number) => ({
     opacity: entranceAnims[index],
@@ -889,59 +888,64 @@ export default function HomeScreen() {
         </Animated.View>
 
         {/* ── Workload + Capacity metrics ──────────────────────────────── */}
-        {!isEmpty && (
-          <Animated.View style={entranceStyle(1)}>
-            <View style={styles.metricsRow}>
-              <Card variant="card" inset={false} style={styles.metricCard}>
-                <View style={styles.metricInner}>
-                  <View style={styles.metricIconRow}>
-                    <Ionicons name="layers-outline" size={14} color={TEXT_TERTIARY} />
-                    <Text style={styles.metricLabel}>Workload</Text>
-                  </View>
-                  <Text style={styles.metricValue}>{allIncompleteCount}</Text>
-                  <Text style={styles.metricSub}>
-                    {allIncompleteCount === 1 ? 'task' : 'tasks'} · {Math.round(meetingMinutes / 60)}h meetings
-                  </Text>
+        <Animated.View style={entranceStyle(1)}>
+          <View style={styles.metricsRow}>
+            <Card variant="card" inset={false} style={styles.metricCard}>
+              <View style={styles.metricInner}>
+                <View style={styles.metricIconRow}>
+                  <Ionicons name="layers-outline" size={14} color={TEXT_TERTIARY} />
+                  <Text style={styles.metricLabel}>Workload</Text>
                 </View>
-              </Card>
+                <Text style={[styles.metricValue, isEmpty && styles.metricValueEmpty]}>
+                  {isEmpty ? '—' : allIncompleteCount}
+                </Text>
+                <Text style={styles.metricSub}>
+                  {isEmpty ? 'No tasks yet' : `${allIncompleteCount === 1 ? 'task' : 'tasks'} · ${Math.round(meetingMinutes / 60)}h meetings`}
+                </Text>
+              </View>
+            </Card>
 
-              <Card variant="card" inset={false} style={styles.metricCard}>
-                <View style={styles.metricInner}>
-                  <View style={styles.metricIconRow}>
-                    <Ionicons name="battery-charging-outline" size={14} color={TEXT_TERTIARY} />
-                    <Text style={styles.metricLabel}>Capacity</Text>
-                  </View>
-                  <Text style={styles.metricValue}>{capacity}</Text>
-                  <Text style={styles.metricSub}>tasks recommended</Text>
+            <Card variant="card" inset={false} style={styles.metricCard}>
+              <View style={styles.metricInner}>
+                <View style={styles.metricIconRow}>
+                  <Ionicons name="battery-charging-outline" size={14} color={TEXT_TERTIARY} />
+                  <Text style={styles.metricLabel}>Capacity</Text>
                 </View>
-              </Card>
-            </View>
+                <Text style={[styles.metricValue, isEmpty && styles.metricValueEmpty]}>
+                  {isEmpty ? '—' : capacity}
+                </Text>
+                <Text style={styles.metricSub}>
+                  {isEmpty ? 'Add tasks to calculate' : 'tasks recommended'}
+                </Text>
+              </View>
+            </Card>
+          </View>
 
-            <DailySummaryCard summary={dailySummaryData.summaryText} />
-          </Animated.View>
-        )}
+          <DailySummaryCard
+            summary={
+              isEmpty
+                ? 'Gathering data — your daily summary will appear once you have tasks and health data syncing.'
+                : dailySummaryData.summaryText
+            }
+            feedback={isEmpty ? null : dailySummaryData.feedback}
+            onFeedback={submitFeedback}
+          />
+        </Animated.View>
 
         {/* ── Mood check-in ─────────────────────────────────────────── */}
         <Animated.View style={entranceStyle(2)}>
           <MoodCheckIn />
         </Animated.View>
 
-        {/* ── Content ──────────────────────────────────────────────────── */}
-        {isEmpty ? (
-          <Animated.View style={[styles.emptyWrap, entranceStyle(1)]}>
-            <Text style={styles.emptyTitle}>All clear</Text>
-            <Text style={styles.emptySubtitle}>Add tasks in the Calendar tab to see them here</Text>
+        {/* ── Recovery + Weekly ────────────────────────────────────────── */}
+        <View style={styles.sectionsWrap}>
+          <Animated.View style={entranceStyle(3)}>
+            <RecoveryMomentsCard rechargeSlots={finalRechargeSlots} />
           </Animated.View>
-        ) : (
-          <View style={styles.sectionsWrap}>
-            <Animated.View style={entranceStyle(4)}>
-              <RecoveryMomentsCard rechargeSlots={finalRechargeSlots} />
-            </Animated.View>
-            <Animated.View style={entranceStyle(5)}>
-              <ProgressCard />
-            </Animated.View>
-          </View>
-        )}
+          <Animated.View style={entranceStyle(4)}>
+            <ProgressCard isEmpty={isEmpty} />
+          </Animated.View>
+        </View>
       </ScrollView>
       </SafeAreaView>
 
@@ -952,8 +956,6 @@ export default function HomeScreen() {
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
-
-const ROW_DIVIDER = colors.divider.subtle;
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1 },
@@ -1042,6 +1044,10 @@ const styles = StyleSheet.create({
     color: TEXT_PRIMARY,
     letterSpacing: -0.5,
   },
+  metricValueEmpty: {
+    color: TEXT_TERTIARY,
+    fontSize: 28,
+  },
   metricSub: {
     fontSize: 12,
     lineHeight: 16,
@@ -1049,217 +1055,8 @@ const styles = StyleSheet.create({
     color: TEXT_SECONDARY,
   },
 
-  /* ── Day summary ── */
-  summaryCard: {
-    marginBottom: 20,
-    borderRadius: borderRadius.card,
-    overflow: 'hidden',
-  },
-  summaryInner: {
-    padding: 14,
-  },
-  summaryText: {
-    fontSize: typography.body.fontSize,
-    lineHeight: typography.body.lineHeight,
-    fontFamily: fonts.bodyRegular,
-    color: TEXT_SECONDARY,
-  },
-
   /* ── Sections wrap ── */
   sectionsWrap: { gap: 12 },
-
-  /* ── Section card ── */
-  sectionWrap: {
-    borderRadius: borderRadius.card,
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-  },
-  sectionLabel: {
-    flex: 1,
-    fontSize: typography.cardTitle.fontSize,
-    lineHeight: typography.cardTitle.lineHeight,
-    fontFamily: fonts.bodyMedium,
-    color: TEXT_PRIMARY,
-  },
-  sectionCountBadge: {
-    backgroundColor: colors.control.chipBg,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sectionCount: {
-    fontSize: 12,
-    fontFamily: fonts.bodyMedium,
-    color: TEXT_SECONDARY,
-  },
-
-  /* ── Grouped task card ── */
-  taskGroup: {
-    overflow: 'hidden',
-    backgroundColor: 'transparent',
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.divider.subtle,
-  },
-  rowDivider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: colors.divider.subtle,
-    marginLeft: 16,
-  },
-
-  /* ── Task row ── */
-  taskRow: {
-    flexDirection: 'row',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    gap: 12,
-    alignItems: 'center',
-  },
-  taskRowRecovery: {
-    backgroundColor: 'rgba(255, 217, 61, 0.06)',
-  },
-
-  /* Time column */
-  timeCol: {
-    width: 40,
-    alignItems: 'center',
-    gap: 3,
-    paddingTop: 2,
-  },
-  timeStart: {
-    fontSize: typography.caption.fontSize,
-    lineHeight: typography.caption.lineHeight,
-    fontFamily: fonts.bodyLight,
-    color: TEXT_SECONDARY,
-  },
-  timeLine: {
-    width: 1,
-    flex: 1,
-    minHeight: 10,
-    backgroundColor: ROW_DIVIDER,
-  },
-  timeEnd: {
-    fontSize: 11,
-    fontFamily: fonts.bodyLight,
-    color: TEXT_SECONDARY,
-  },
-
-  /* Task content */
-  taskContent: {
-    flex: 1,
-    gap: 5,
-  },
-  taskTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 10,
-    position: 'relative',
-  },
-  taskTitle: {
-    flex: 1,
-    fontSize: typography.body.fontSize,
-    lineHeight: typography.body.lineHeight,
-    fontFamily: fonts.bodyMedium,
-    color: TEXT_PRIMARY,
-  },
-  checkbox: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    borderColor: colors.divider.strong,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 1,
-    flexShrink: 0,
-  },
-  checkboxDone: {
-    backgroundColor: palette.accentYellow,
-    borderColor: palette.accentYellow,
-  },
-  taskChipRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  typeChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    borderRadius: borderRadius.pill,
-  },
-  typeDot: { width: 5, height: 5, borderRadius: 3 },
-  typeLabel: { fontSize: typography.caption.fontSize, fontFamily: fonts.bodyLight, color: colors.ink.secondary },
-  durationLabel: {
-    fontSize: 11,
-    fontFamily: fonts.bodyLight,
-    color: TEXT_TERTIARY,
-  },
-
-  pointsTag: {
-    position: 'absolute',
-    right: 0,
-    top: -6,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 999,
-    backgroundColor: 'rgba(255, 217, 61, 0.18)',
-  },
-  pointsText: {
-    fontSize: 11,
-    fontFamily: fonts.bodyMedium,
-    color: palette.accentOrange,
-    letterSpacing: 0.2,
-  },
-
-  /* Subtasks */
-  subtaskList: {
-    gap: 5,
-    paddingTop: 6,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: ROW_DIVIDER,
-    marginTop: 4,
-  },
-  subtaskRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  subtaskDot: {
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: palette.accentYellow,
-  },
-  subtaskText: { flex: 1, fontSize: 13, fontFamily: fonts.bodyRegular, color: TEXT_SECONDARY },
-  subtaskDur: { fontSize: 11, fontFamily: fonts.bodyLight, color: TEXT_TERTIARY },
-
-  /* Empty state */
-  emptyWrap: {
-    marginTop: 40,
-    alignItems: 'center',
-    gap: 6,
-  },
-  emptyTitle: {
-    fontSize: 17,
-    fontFamily: fonts.bodyMedium,
-    color: TEXT_PRIMARY,
-  },
-  emptySubtitle: {
-    fontSize: 14,
-    fontFamily: fonts.bodyRegular,
-    color: TEXT_SECONDARY,
-    textAlign: 'center',
-    lineHeight: 20,
-  },
 
   /* ── Mood check-in ── */
   checkInWrap: {

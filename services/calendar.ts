@@ -11,6 +11,7 @@ import { Platform } from 'react-native';
 import * as Calendar from 'expo-calendar';
 import * as AuthSession from 'expo-auth-session';
 import * as Crypto from 'expo-crypto';
+import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import { supabase } from '@/services/supabase';
 
 // ─── Apple Calendar (EventKit) ────────────────────────────────────────────────
@@ -82,46 +83,39 @@ export async function syncAppleCalendar(): Promise<void> {
 
 // ─── Google Calendar OAuth ────────────────────────────────────────────────────
 
-const GOOGLE_AUTH_CONFIG: AuthSession.AuthRequestConfig = {
-  clientId: Platform.select({
-    ios: process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID_IOS!,
-    android: process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID!,
-  })!,
-  scopes: [
-    'openid',
-    'email',
-    'profile',
-    'https://www.googleapis.com/auth/calendar.readonly',
-  ],
-  redirectUri: AuthSession.makeRedirectUri({ scheme: 'emz', path: 'oauth2redirect' }),
-  responseType: AuthSession.ResponseType.Code,
-  usePKCE: true,
-};
-
-const GOOGLE_DISCOVERY = {
-  authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
-  tokenEndpoint: 'https://oauth2.googleapis.com/token',
-};
-
 /**
- * Opens Google OAuth consent screen and syncs calendar on success.
- * Returns true if successfully connected.
+ * Connects Google Calendar using the native Google Sign-In SDK.
+ *
+ * GoogleSignin is already configured in AuthContext with offlineAccess: true
+ * and the calendar.readonly scope. When a user signs in, Google issues a
+ * serverAuthCode which the edge function exchanges server-side for tokens.
+ * This avoids all redirect URI issues — no URI registration in Google Console needed.
  */
 export async function connectGoogleCalendar(): Promise<boolean> {
-  const request = new AuthSession.AuthRequest({
-    ...GOOGLE_AUTH_CONFIG,
-    extraParams: { access_type: 'offline', prompt: 'consent' },
+  // Reconfigure with calendar scope + offlineAccess only here.
+  // Auth sign-in (AuthContext) uses a minimal config with no calendar scope,
+  // so users aren't prompted for calendar access just by signing in.
+  GoogleSignin.configure({
+    webClientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID!,
+    iosClientId: process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID_IOS,
+    scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+    offlineAccess: true,
   });
 
-  await request.makeAuthUrlAsync(GOOGLE_DISCOVERY);
-  const result = await request.promptAsync(GOOGLE_DISCOVERY);
+  let serverAuthCode: string | null = null;
+  try {
+    await GoogleSignin.hasPlayServices();
+    const response = await GoogleSignin.signIn();
+    serverAuthCode = response.data?.serverAuthCode ?? null;
+  } catch {
+    return false;
+  }
 
-  if (result.type !== 'success') return false;
+  if (!serverAuthCode) return false;
 
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return false;
 
-  // Send auth code + code_verifier to edge function for token exchange
   const url = `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/calendar-sync-google`;
   const res = await fetch(url, {
     method: 'POST',
@@ -129,14 +123,14 @@ export async function connectGoogleCalendar(): Promise<boolean> {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${session.access_token}`,
     },
-    body: JSON.stringify({
-      authCode: result.params.code,
-      codeVerifier: request.codeVerifier,
-      redirectUri: GOOGLE_AUTH_CONFIG.redirectUri,
-    }),
+    body: JSON.stringify({ serverAuthCode }),
   });
 
-  return res.ok;
+  if (!res.ok) return false;
+
+  // Immediately sync events so they appear without waiting for the background task
+  await syncGoogleCalendar().catch(() => {});
+  return true;
 }
 
 /**

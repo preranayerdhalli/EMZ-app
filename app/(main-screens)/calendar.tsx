@@ -10,6 +10,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
+import { useRouter } from 'expo-router';
+import { HeaderIconButton } from '@/components/ScreenHeader';
 import { Ionicons } from '@expo/vector-icons';
 import { AppBackground } from '@/components/AuthBackground';
 import { ScreenHeaderTitle } from '@/components/ScreenHeader';
@@ -30,12 +32,21 @@ import {
 import { useCalendarItems } from '@/hooks/useCalendarItems';
 import { useEnergy } from '@/hooks/useEnergy';
 import type { CalendarItem, CalendarSource } from '@/constants/calendarTypes';
+import {
+  connectGoogleCalendar,
+  connectMicrosoftCalendar,
+  syncAppleCalendar,
+  syncGoogleCalendar,
+  syncMicrosoftCalendar,
+  getConnectedCalendars,
+} from '@/services/calendar';
+import { usePostHog } from 'posthog-react-native';
 
 // ─── Timeline constants ───────────────────────────────────────────────────────
 
 const HOUR_HEIGHT = 64;
-const DAY_START_HOUR = 7;
-const DAY_END_HOUR = 21;
+const DAY_START_HOUR = 0;
+const DAY_END_HOUR = 24;
 const DAY_START_MIN = DAY_START_HOUR * 60;
 const HOURS = Array.from(
   { length: DAY_END_HOUR - DAY_START_HOUR },
@@ -77,7 +88,7 @@ function getTaskEnergy(workType: string): EnergyLevel {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const todayStr = new Date().toISOString().slice(0, 10);
+function getTodayStr() { return new Date().toISOString().slice(0, 10); }
 
 function fmtHour(hour: number): string {
   if (hour === 12) return '12p';
@@ -103,10 +114,10 @@ function getCurrentTimeTop(): number {
   return minToTop(now.getHours() * 60 + now.getMinutes());
 }
 
-const MOCK_CONNECTIONS = [
-  { source: 'google' as CalendarSource, connected: true, visible: true },
-  { source: 'microsoft' as CalendarSource, connected: false },
-  { source: 'apple' as CalendarSource, connected: false },
+const DEFAULT_CONNECTIONS = [
+  { source: 'google' as CalendarSource, connected: false, visible: true },
+  { source: 'microsoft' as CalendarSource, connected: false, visible: true },
+  { source: 'apple' as CalendarSource, connected: false, visible: true },
 ];
 
 // ─── Timeline card ────────────────────────────────────────────────────────────
@@ -168,18 +179,20 @@ function EnergyRow({
   suggestedWorkType,
   prevSuggestedWorkType,
   isMicroBreak,
+  hasData,
 }: {
   hour: number;
   energy: EnergyLevel;
   suggestedWorkType: string;
   prevSuggestedWorkType: string | null;
   isMicroBreak: boolean;
+  hasData: boolean;
 }) {
   const label = isMicroBreak ? 'Break' : (WORK_TYPE_LABELS[suggestedWorkType] ?? suggestedWorkType);
   const prevLabel = prevSuggestedWorkType
     ? (isMicroBreak ? 'Break' : (WORK_TYPE_LABELS[prevSuggestedWorkType] ?? prevSuggestedWorkType))
     : null;
-  const showLabel = !prevLabel || prevLabel !== label;
+  const showLabel = hasData && (!prevLabel || prevLabel !== label);
   const dotX = ENERGY_DOT_X[energy];
 
   return (
@@ -187,7 +200,7 @@ function EnergyRow({
       {showLabel && (
         <Text style={energyStyles.workLabel} numberOfLines={1}>{label}</Text>
       )}
-      <View style={[energyStyles.dot, { left: dotX }]} />
+      {hasData && <View style={[energyStyles.dot, { left: dotX }]} />}
     </View>
   );
 }
@@ -198,10 +211,12 @@ function Timeline({
   items,
   scrollRef,
   energyByHour,
+  hasData,
 }: {
   items: CalendarItem[];
   scrollRef: React.RefObject<ScrollView | null>;
   energyByHour: Record<number, { energyLevel: EnergyLevel; suggestedWorkType: string; isMicroBreak: boolean }>;
+  hasData: boolean;
 }) {
   const { width } = useWindowDimensions();
   // Left panel width = total - divider - energy panel
@@ -223,11 +238,7 @@ function Timeline({
     return () => clearTimeout(t);
   }, []);
 
-  const visibleItems = items.filter(
-    (i) =>
-      i.data.startMinutes >= DAY_START_MIN &&
-      i.data.startMinutes < DAY_END_HOUR * 60
-  );
+  const visibleItems = items;
 
   const showNow = nowTop >= 0 && nowTop <= totalHeight;
 
@@ -287,6 +298,7 @@ function Timeline({
                 suggestedWorkType={data.suggestedWorkType}
                 prevSuggestedWorkType={prevData?.suggestedWorkType ?? null}
                 isMicroBreak={data.isMicroBreak}
+                hasData={hasData}
               />
             );
           })}
@@ -372,18 +384,37 @@ function CalendarMenuModal({
 export default function CalendarScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
+  const router = useRouter();
+  const posthog = usePostHog();
   const scrollRef = useRef<ScrollView>(null);
 
-  const [viewingDate, setViewingDate] = useState(todayStr);
-  const { items, addTask, updateTask, deleteTask, markCompleted } = useCalendarItems(viewingDate);
-  const { energyByHour } = useEnergy(viewingDate);
+  const [viewingDate, setViewingDate] = useState(() => getTodayStr());
+  const { items, addTask, updateTask, deleteTask, markCompleted, refresh } = useCalendarItems(viewingDate);
+  const { energyByHour, hasData: energyHasData } = useEnergy(viewingDate);
   const [addTaskVisible, setAddTaskVisible] = useState(false);
   const [connectedVisible, setConnectedVisible] = useState(false);
   const [viewTasksVisible, setViewTasksVisible] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
   const [editTask, setEditTask] = useState<CalendarItem | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [connections, setConnections] = useState(MOCK_CONNECTIONS);
+  const [connections, setConnections] = useState(DEFAULT_CONNECTIONS);
+
+  // Load connection state on mount, then background-sync any connected calendars
+  useEffect(() => {
+    getConnectedCalendars().then(async (connected) => {
+      setConnections((prev) =>
+        prev.map((c) => ({ ...c, connected: connected.has(c.source) }))
+      );
+      const syncs: Promise<void>[] = [];
+      if (connected.has('google'))    syncs.push(syncGoogleCalendar().catch(() => {}));
+      if (connected.has('microsoft')) syncs.push(syncMicrosoftCalendar().catch(() => {}));
+      if (connected.has('apple'))     syncs.push(syncAppleCalendar().catch(() => {}));
+      if (syncs.length > 0) {
+        await Promise.all(syncs);
+        refresh();
+      }
+    });
+  }, []);
 
   const goPrev = () => {
     const d = new Date(viewingDate);
@@ -397,7 +428,7 @@ export default function CalendarScreen() {
   };
 
   const periodLabel =
-    viewingDate === todayStr
+    viewingDate === getTodayStr()
       ? 'Today'
       : new Date(viewingDate).toLocaleDateString('default', {
           weekday: 'short',
@@ -405,17 +436,25 @@ export default function CalendarScreen() {
           month: 'short',
         });
 
-  // items from useCalendarItems() are already filtered by date + completed=false
-  const getItemsForDate = useCallback(
-    (_date: string) => items,
-    [items]
-  );
-
   useLayoutEffect(() => {
     navigation.setOptions({
       headerLeft: () => null,
       headerTitle: () => <ScreenHeaderTitle title="Calendar" />,
-      headerRight: () => null,
+      headerRight: () => (
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <HeaderIconButton
+            icon="ellipsis-horizontal"
+            accessibilityLabel="Calendar menu"
+            onPress={() => setMenuVisible(true)}
+          />
+          <HeaderIconButton
+            icon="settings-outline"
+            accessibilityLabel="Settings"
+            onPress={() => router.push('/settings')}
+            style={{ marginRight: 8 }}
+          />
+        </View>
+      ),
     });
   }, [navigation]);
 
@@ -451,6 +490,12 @@ export default function CalendarScreen() {
           isRecovery: false,
           completed: false,
         } as any);
+        posthog?.capture('task_created', {
+          work_type: task.workType,
+          priority: task.priority,
+          is_procrastinated: task.isProcrastinated ?? false,
+          duration_minutes: task.durationMinutes ?? 60,
+        });
         const msg = task.isProcrastinated
           ? `Locked in ${day} ${time}${dur}`
           : `Scheduled ${day} ${time}${dur}`;
@@ -484,9 +529,10 @@ export default function CalendarScreen() {
 
         {/* ── Timeline ── */}
         <Timeline
-          items={getItemsForDate(viewingDate)}
+          items={items}
           scrollRef={scrollRef}
           energyByHour={energyByHour}
+          hasData={energyHasData}
         />
       </View>
 
@@ -546,15 +592,16 @@ export default function CalendarScreen() {
         onClose={() => setConnectedVisible(false)}
         connections={connections}
         onConnect={async (source) => {
-          const { connectGoogleCalendar, connectMicrosoftCalendar, syncAppleCalendar } = await import('@/services/calendar');
           let ok = false;
           if (source === 'google')    ok = await connectGoogleCalendar();
           else if (source === 'microsoft') ok = await connectMicrosoftCalendar();
           else if (source === 'apple') { await syncAppleCalendar(); ok = true; }
           if (ok) {
+            posthog?.capture('calendar_connected', { source });
             setConnections((prev) =>
               prev.map((c) => c.source === source ? { ...c, connected: true, visible: true } : c)
             );
+            refresh();
             setToast(`${source} calendar connected`);
             setTimeout(() => setToast(null), 2500);
           }

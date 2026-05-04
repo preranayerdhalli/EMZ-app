@@ -4,11 +4,65 @@ import * as SecureStore from 'expo-secure-store';
 const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!;
 
-// expo-secure-store adapter so Supabase Auth tokens are stored encrypted on device
+// SecureStore has a 2048-byte limit per key. Supabase sessions (JWT + user object)
+// routinely exceed this, so we split large values into 2000-byte chunks.
+const CHUNK_SIZE = 2000;
+const chunkCountKey = (key: string) => `${key}__chunks`;
+const chunkKey = (key: string, i: number) => `${key}__chunk_${i}`;
+
+// Deletes all chunk keys for a given storage key (shared by setItem + removeItem)
+async function deleteChunks(key: string): Promise<void> {
+  const countStr = await SecureStore.getItemAsync(chunkCountKey(key));
+  if (!countStr) return;
+  const count = parseInt(countStr, 10);
+  if (isNaN(count)) return;
+  await Promise.all([
+    ...Array.from({ length: count }, (_, i) => SecureStore.deleteItemAsync(chunkKey(key, i))),
+    SecureStore.deleteItemAsync(chunkCountKey(key)),
+  ]);
+}
+
 const ExpoSecureStoreAdapter = {
-  getItem: (key: string) => SecureStore.getItemAsync(key),
-  setItem: (key: string, value: string) => SecureStore.setItemAsync(key, value),
-  removeItem: (key: string) => SecureStore.deleteItemAsync(key),
+  async getItem(key: string): Promise<string | null> {
+    const direct = await SecureStore.getItemAsync(key);
+    if (direct !== null) return direct;
+
+    const countStr = await SecureStore.getItemAsync(chunkCountKey(key));
+    if (!countStr) return null;
+    const count = parseInt(countStr, 10);
+    if (isNaN(count)) return null;
+    const parts = await Promise.all(
+      Array.from({ length: count }, (_, i) => SecureStore.getItemAsync(chunkKey(key, i))),
+    );
+    if (parts.some((p) => p === null)) return null;
+    return parts.join('');
+  },
+
+  async setItem(key: string, value: string): Promise<void> {
+    // Always clear stale chunks from a previous large write before storing
+    await Promise.all([
+      SecureStore.deleteItemAsync(key),
+      deleteChunks(key),
+    ]);
+    if (value.length <= CHUNK_SIZE) {
+      await SecureStore.setItemAsync(key, value);
+      return;
+    }
+    const count = Math.ceil(value.length / CHUNK_SIZE);
+    await Promise.all(
+      Array.from({ length: count }, (_, i) =>
+        SecureStore.setItemAsync(chunkKey(key, i), value.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)),
+      ),
+    );
+    await SecureStore.setItemAsync(chunkCountKey(key), String(count));
+  },
+
+  async removeItem(key: string): Promise<void> {
+    await Promise.all([
+      SecureStore.deleteItemAsync(key),
+      deleteChunks(key),
+    ]);
+  },
 };
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -29,11 +83,14 @@ export type Priority = 'high' | 'medium' | 'low';
 export type EnergyLevel = 'high' | 'moderate' | 'low';
 export type Chronotype = 'morning' | 'neutral' | 'evening';
 export type CalendarProvider = 'google' | 'microsoft' | 'apple';
-export type BiometricSource = 'healthkit' | 'health_connect' | 'manual';
+export type BiometricSource = 'healthkit' | 'health_connect' | 'samsung_sensor' | 'manual';
 
 export interface DBUser {
   id: string;
   email: string;
+  full_name: string | null;
+  birthday: string | null;        // YYYY-MM-DD
+  gender: 'male' | 'female' | null;
   timezone: string;
   chronotype: Chronotype;
   created_at: string;
@@ -145,6 +202,8 @@ export interface DBDailySummary {
   mood_score: number | null;
   recommendations_json: Array<{ type: string; text: string }> | null;
   generated_at: string;
+  feedback: 'up' | 'down' | null;
+  feedback_at: string | null;
 }
 
 // ─── Typed helpers ─────────────────────────────────────────────────────────────

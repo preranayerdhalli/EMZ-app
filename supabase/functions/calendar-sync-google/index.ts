@@ -35,7 +35,13 @@ serve(async (req) => {
     const { data: { user }, error: authErr } = await supabase.auth.getUser();
     if (authErr || !user) return new Response('Unauthorized', { status: 401, headers: CORS });
 
-    const body = await req.json() as { authCode?: string; redirectUri?: string };
+    const body = await req.json() as {
+      serverAuthCode?: string; // from native GoogleSignin SDK (preferred — no redirect URI needed)
+      authCode?: string;       // legacy expo-auth-session flow
+      codeVerifier?: string;
+      clientId?: string;
+      redirectUri?: string;
+    };
 
     let accessToken: string;
     let refreshToken: string | undefined;
@@ -49,18 +55,63 @@ serve(async (req) => {
       .eq('provider', 'google')
       .single();
 
-    if (body.authCode) {
-      // First connect — exchange auth code for tokens
+    if (body.serverAuthCode) {
+      // Native Google Sign-In server auth code — server-side exchange, no redirect URI needed.
+      // Requires GOOGLE_CLIENT_ID (web client) and GOOGLE_CLIENT_SECRET set in edge function env.
+      const clientId = Deno.env.get('GOOGLE_CLIENT_ID')!;
+      const clientSecret = Deno.env.get('GOOGLE_CLIENT_SECRET')!;
+
       const tokenRes = await fetch(GOOGLE_TOKEN_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
-          code: body.authCode,
-          client_id: Deno.env.get('GOOGLE_CLIENT_ID')!,
-          client_secret: Deno.env.get('GOOGLE_CLIENT_SECRET')!,
-          redirect_uri: body.redirectUri ?? 'com.emz.app:/oauth2redirect',
+          code: body.serverAuthCode,
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: '',
           grant_type: 'authorization_code',
         }),
+      });
+      const tokenData = await tokenRes.json();
+      if (tokenData.error) throw new Error(`Google OAuth error: ${tokenData.error_description}`);
+
+      accessToken  = tokenData.access_token;
+      refreshToken = tokenData.refresh_token;
+
+      await supabase.from('calendar_tokens').upsert({
+        user_id: user.id,
+        provider: 'google',
+        access_token_enc: new TextEncoder().encode(accessToken),
+        refresh_token_enc: refreshToken ? new TextEncoder().encode(refreshToken) : null,
+        expires_at: new Date(Date.now() + tokenData.expires_in * 1000).toISOString(),
+        scope: tokenData.scope,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id,provider' });
+
+    } else if (body.authCode) {
+      // Legacy expo-auth-session PKCE flow (kept for backwards compatibility)
+      const clientId = body.clientId
+        ?? Deno.env.get('GOOGLE_CLIENT_ID_IOS')
+        ?? Deno.env.get('GOOGLE_CLIENT_ID')!;
+
+      const params: Record<string, string> = {
+        code: body.authCode,
+        client_id: clientId,
+        redirect_uri: body.redirectUri ?? 'emz://oauth2redirect',
+        grant_type: 'authorization_code',
+      };
+
+      if (body.codeVerifier) {
+        params.code_verifier = body.codeVerifier;
+      } else {
+        const secret = Deno.env.get('GOOGLE_CLIENT_SECRET');
+        if (secret) params.client_secret = secret;
+      }
+
+      const tokenRes = await fetch(GOOGLE_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(params),
       });
       const tokenData = await tokenRes.json();
       if (tokenData.error) throw new Error(`Google OAuth error: ${tokenData.error_description}`);
@@ -85,15 +136,22 @@ serve(async (req) => {
 
       if (expired && tokenRow.refresh_token_enc) {
         const storedRefresh = new TextDecoder().decode(new Uint8Array(tokenRow.refresh_token_enc));
+        const refreshClientId = body.clientId
+          ?? Deno.env.get('GOOGLE_CLIENT_ID_IOS')
+          ?? Deno.env.get('GOOGLE_CLIENT_ID')!;
+
+        const refreshParams: Record<string, string> = {
+          refresh_token: storedRefresh,
+          client_id: refreshClientId,
+          grant_type: 'refresh_token',
+        };
+        const secret = Deno.env.get('GOOGLE_CLIENT_SECRET');
+        if (secret) refreshParams.client_secret = secret;
+
         const refreshRes = await fetch(GOOGLE_TOKEN_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            refresh_token: storedRefresh,
-            client_id: Deno.env.get('GOOGLE_CLIENT_ID')!,
-            client_secret: Deno.env.get('GOOGLE_CLIENT_SECRET')!,
-            grant_type: 'refresh_token',
-          }),
+          body: new URLSearchParams(refreshParams),
         });
         const refreshData = await refreshRes.json();
         if (refreshData.error) throw new Error(`Token refresh error: ${refreshData.error_description}`);

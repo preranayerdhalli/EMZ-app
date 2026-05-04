@@ -80,12 +80,7 @@ export function useCalendarItems(date: string): {
         });
       }
 
-      // Sort combined items by start time
-      calItems.sort((a, b) => {
-        const aStart = a.type === 'task' ? a.data.startMinutes : a.data.startMinutes;
-        const bStart = b.type === 'task' ? b.data.startMinutes : b.data.startMinutes;
-        return aStart - bStart;
-      });
+      calItems.sort((a, b) => a.data.startMinutes - b.data.startMinutes);
 
       setItems(calItems);
       setLoading(false);

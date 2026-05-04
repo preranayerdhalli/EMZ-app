@@ -7,15 +7,24 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
-      "prebuildCommand": "npx expo prebuild --platform android"
+      "ios": {
+        "prebuildCommand": "npx expo prebuild --platform ios --clean"
+      },
+      "android": {
+        "prebuildCommand": "npx expo prebuild --platform android --clean"
+      }
     },
     "preview": {
       "distribution": "internal",
-      "prebuildCommand": "npx expo prebuild --platform android"
+      "ios": {
+        "prebuildCommand": "npx expo prebuild --platform ios --clean"
+      }
     },
     "production": {
       "autoIncrement": true,
-      "prebuildCommand": "npx expo prebuild --platform android"
+      "ios": {
+        "prebuildCommand": "npx expo prebuild --platform ios --clean"
+      }
     }
   },
   "submit": {

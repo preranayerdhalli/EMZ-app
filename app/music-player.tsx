@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, router } from 'expo-router';
+import { usePostHog } from 'posthog-react-native';
 import { AppBackground } from '@/components/AuthBackground';
 import { palette, colors, typography, fonts, borderRadius } from '@/constants/theme';
 
@@ -103,6 +104,7 @@ export default function MusicPlayerScreen() {
   const title = params.title ?? 'Lo-fi Chill Beats';
   const mood = params.mood ?? 'Focus · Calm';
 
+  const posthog = usePostHog();
   const [playing, setPlaying] = useState(false);
   const [currentSec, setCurrentSec] = useState(0);
   const [liked, setLiked] = useState(false);
@@ -247,7 +249,11 @@ export default function MusicPlayerScreen() {
             <Ionicons name="play-skip-back" size={30} color={colors.ink.primary} />
           </Pressable>
 
-          <Pressable style={styles.playBtn} onPress={() => setPlaying(p => !p)}>
+          <Pressable style={styles.playBtn} onPress={() => {
+            const next = !playing;
+            if (next) posthog?.capture('music_played', { title, mood });
+            setPlaying(next);
+          }}>
             <Ionicons
               name={playing ? 'pause' : 'play'}
               size={30}

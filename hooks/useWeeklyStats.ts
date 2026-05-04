@@ -45,32 +45,23 @@ export function useWeeklyStats(weekStart?: string): {
     if (!user) { setLoading(false); return; }
     setLoading(true);
 
-    supabase.functions
-      .invoke<WeekDayStat[]>('weekly-stats', {
-        body: {},
-        headers: {},
-        method: 'GET',
-        // Pass weekStart as query param via the URL workaround
-      })
-      .catch(() => null)
-      .then(async () => {
-        // Invoke via fetch with query params (supabase.functions.invoke doesn't support GET params)
-        const { data: { session } } = await supabase.auth.getSession();
-        if (!session) { setLoading(false); return; }
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { setLoading(false); return; }
 
+      try {
         const url = `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/weekly-stats?weekStart=${monday}`;
         const res = await fetch(url, {
           headers: { Authorization: `Bearer ${session.access_token}` },
         });
-
         if (res.ok) {
           const data: WeekDayStat[] = await res.json();
-          if (Array.isArray(data) && data.length === 7) {
-            setWeekData(data);
-          }
+          if (Array.isArray(data) && data.length === 7) setWeekData(data);
         }
-        setLoading(false);
-      });
+      } catch { /* Network error — keep fallback */ }
+
+      setLoading(false);
+    })();
   }, [user, monday, tick]);
 
   return { weekData, loading, refresh: () => setTick((t) => t + 1) };

@@ -20,8 +20,12 @@ export const palette = {
 // ─── Font families ────────────────────────────────────────────────────────────
 
 export const fonts = {
-  /** Main display titles, capacity score number */
-  display: 'AGBookRounded-Bold',
+  /**
+   * Main display titles, capacity score number.
+   * To use AGBookRounded-Bold: add AGBookRounded-Bold.ttf to assets/fonts/,
+   * load it in app/_layout.tsx via useFonts, then change this to 'AGBookRounded-Bold'.
+   */
+  display: 'Poppins_500Medium',
   /** Button labels, card titles, important UI labels */
   bodyMedium: 'Poppins_500Medium',
   /** Body text, descriptions */

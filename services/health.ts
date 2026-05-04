@@ -1,334 +1,177 @@
 /**
  * services/health.ts
  *
- * Reads biometric data from HealthKit (iOS) or Health Connect (Android)
- * and POSTs it to the health-sync edge function.
+ * Health data sync via Open Wearables SDK.
+ * Replaces the previous react-native-health (HealthKit), react-native-health-connect,
+ * and Samsung Health Sensor SDK integrations.
  *
- * IMPORTANT: This module requires a dev build (expo prebuild).
- *   Run: npx expo prebuild
- *   Then: npx expo run:ios  or  npx expo run:android
+ * Architecture:
+ *   Open Wearables SDK ─► OW Server (Docker) ─► Supabase health-sync
  *
- * Install packages (already done by npm install step):
- *   npm install react-native-health react-native-health-connect
+ * Required env vars:
+ *   EXPO_PUBLIC_OW_HOST     — base URL of your OW server, e.g. https://ow.yourapp.com
+ *   EXPO_PUBLIC_OW_API_KEY  — API key created in the OW developer portal
+ *
+ * Android prerequisite: publish the OW Android SDK to Maven Local before building:
+ *   git clone https://github.com/the-momentum/open_wearables_android_sdk
+ *   cd open_wearables_android_sdk && git checkout v0.6.0
+ *   ./gradlew publishToMavenLocal
+ *
+ * Requires a dev build (expo prebuild + expo run:ios / run:android).
  */
 
+import OpenWearablesSDK, { HealthDataType } from 'open-wearables';
 import { Platform } from 'react-native';
 import { supabase } from '@/services/supabase';
 
-// Lazy imports — these native modules only exist in dev builds
-// Using dynamic require() to avoid crashes in Expo Go
-function getHealthKit() {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('react-native-health').default as typeof import('react-native-health').default;
-}
+const OW_HOST = process.env.EXPO_PUBLIC_OW_HOST ?? '';
+const OW_API_KEY = process.env.EXPO_PUBLIC_OW_API_KEY ?? '';
 
-function getHealthConnect() {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('react-native-health-connect') as typeof import('react-native-health-connect');
-}
+// Configure SDK once at module load — safe to call before sign-in
+OpenWearablesSDK.configure(OW_HOST);
 
-// ─── iOS HealthKit permissions ────────────────────────────────────────────────
-
-const IOS_PERMISSIONS = {
-  permissions: {
-    read: [
-      'HeartRateVariabilitySDNN',   // HRV
-      'RestingHeartRate',
-      'SleepAnalysis',
-      'MenstrualFlow',              // Period phase
-      'AppleExerciseTime',
-    ],
-    write: [],
-  },
-};
-
-// ─── Android Health Connect record types ──────────────────────────────────────
-
-const ANDROID_RECORD_TYPES = [
-  'SleepSessionRecord',
-  'HeartRateVariabilityRmssdRecord',
-  'RestingHeartRateRecord',
-  'MenstruationFlowRecord',
-  'ExerciseSessionRecord',
+const HEALTH_TYPES: HealthDataType[] = [
+  HealthDataType.HeartRateVariabilitySDNN,
+  HealthDataType.RestingHeartRate,
+  HealthDataType.OxygenSaturation,
+  HealthDataType.Sleep,
+  HealthDataType.MenstrualFlow,
 ];
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Request health permissions and sync yesterday's + today's biometric data.
- * Safe to call on app foreground — deduped by the UNIQUE constraint on (user_id, date).
+ * Call after Supabase sign-in. Signs the OW SDK in and requests health permissions.
+ * Safe to call multiple times — OW SDK is a no-op if already signed in.
+ */
+export async function initHealthSDK(userId: string): Promise<void> {
+  try {
+    await OpenWearablesSDK.signIn(userId, null, null, OW_API_KEY);
+    await OpenWearablesSDK.requestAuthorization(HEALTH_TYPES);
+  } catch (err) {
+    console.warn('[health] initHealthSDK failed:', err);
+  }
+}
+
+/**
+ * Trigger an immediate sync: OW SDK reads from HealthKit / Health Connect /
+ * Samsung Health and pushes to the OW server, then we forward the daily
+ * summary to the Supabase health-sync edge function.
+ *
+ * Safe to call on foreground — non-throwing.
  */
 export async function syncHealthData(): Promise<void> {
   try {
-    if (Platform.OS === 'ios') {
-      await syncIOS();
-    } else if (Platform.OS === 'android') {
-      await syncAndroid();
-    }
+    if (!OpenWearablesSDK.isSessionValid()) return;
+    await OpenWearablesSDK.syncNow();
+    await forwardOWDataToSupabase();
   } catch (err) {
-    // Non-critical: health sync failure shouldn't crash the app
-    console.warn('Health sync failed:', err);
+    console.warn('[health] syncHealthData failed:', err);
   }
 }
 
-// ─── iOS implementation ───────────────────────────────────────────────────────
-
-async function syncIOS(): Promise<void> {
-  let AppleHealthKit: ReturnType<typeof getHealthKit>;
+/**
+ * Start native background sync (Android WorkManager / iOS BGTask).
+ * Call once at app startup after initHealthSDK().
+ */
+export async function startHealthBackgroundSync(): Promise<void> {
   try {
-    AppleHealthKit = getHealthKit();
-  } catch {
-    console.log('react-native-health not available (Expo Go). Skipping health sync.');
-    return;
+    if (!OpenWearablesSDK.isSessionValid()) return;
+    await OpenWearablesSDK.startBackgroundSync(7); // sync up to 7 days back
+  } catch (err) {
+    console.warn('[health] startBackgroundSync failed:', err);
   }
+}
 
-  // Request permissions
-  await new Promise<void>((resolve, reject) => {
-    AppleHealthKit.initHealthKit(IOS_PERMISSIONS, (err: string) => {
-      if (err) reject(new Error(err));
-      else resolve();
-    });
-  });
+/**
+ * Call on Supabase sign-out to clear the OW SDK session.
+ */
+export function signOutHealthSDK(): void {
+  OpenWearablesSDK.signOut().catch(() => {});
+}
 
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
+// ─── OW server → Supabase forwarding ─────────────────────────────────────────
+
+async function forwardOWDataToSupabase(): Promise<void> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) return;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 
   for (const date of [yesterday, today]) {
-    await syncIOSForDate(AppleHealthKit, date);
+    const payload = await fetchOWDailySummary(date, session.user.id);
+    if (payload) await postHealthSync({ ...payload, date });
   }
 }
 
-async function syncIOSForDate(
-  AppleHealthKit: ReturnType<typeof getHealthKit>,
-  date: Date,
-): Promise<void> {
-  const dateStr = date.toISOString().slice(0, 10);
-  const startDate = new Date(dateStr + 'T00:00:00.000Z').toISOString();
-  const endDate   = new Date(dateStr + 'T23:59:59.999Z').toISOString();
+async function fetchOWDailySummary(
+  date: string,
+  userId: string,
+): Promise<Record<string, unknown> | null> {
+  if (!OW_HOST || !OW_API_KEY) return null;
 
-  const options = { startDate, endDate, ascending: false, limit: 1 };
+  const headers = { 'X-Open-Wearables-API-Key': OW_API_KEY };
 
-  // HRV (overnight average)
-  const hrv = await readIOSSample<any[]>(
-    AppleHealthKit,
-    'getHeartRateVariabilitySamples',
-    options,
-  ).then((samples) => samples?.[0]?.value ?? null);
-
-  // Resting HR
-  const restingHr = await readIOSSample<any[]>(
-    AppleHealthKit,
-    'getRestingHeartRateSamples',
-    options,
-  ).then((samples) => samples?.[0]?.value ?? null);
-
-  // Sleep (previous night — use a 36h window to catch both sides of midnight)
-  const sleepStart = new Date(date);
-  sleepStart.setDate(sleepStart.getDate() - 1);
-  sleepStart.setHours(18, 0, 0, 0);
-
-  const sleepData = await readIOSSample<any[]>(
-    AppleHealthKit,
-    'getSleepSamples',
-    { startDate: sleepStart.toISOString(), endDate: endDate, ascending: true, limit: 50 },
-  ).then((samples) => parseSleepSamplesIOS(samples ?? []));
-
-  // Period flow
-  const periodSamples = await readIOSSample<any[]>(
-    AppleHealthKit,
-    'getMenstrualFlowSamples',
-    { ...options, limit: 5 },
-  ).then((s) => s ?? []);
-  const periodPhase = periodSamples.length > 0 ? inferPeriodPhaseFromFlow(periodSamples) : null;
-
-  const payload = {
-    date: dateStr,
-    sleep_duration_min: sleepData.durationMin,
-    sleep_efficiency: sleepData.efficiency,
-    deep_sleep_pct: sleepData.deepPct,
-    rem_sleep_pct: sleepData.remPct,
-    hrv_ms: hrv,
-    resting_hr: restingHr,
-    period_phase: periodPhase,
-    source: 'healthkit' as const,
-  };
-
-  await postHealthSync(payload);
-}
-
-function readIOSSample<T>(
-  AppleHealthKit: ReturnType<typeof getHealthKit>,
-  method: string,
-  options: Record<string, unknown>,
-): Promise<T | null> {
-  return new Promise((resolve) => {
-    const fn = (AppleHealthKit as any)[method];
-    if (!fn) { resolve(null); return; }
-    fn(options, (err: string, result: T) => {
-      resolve(err ? null : result);
-    });
-  });
-}
-
-function parseSleepSamplesIOS(samples: any[]): {
-  durationMin: number | null;
-  efficiency: number | null;
-  deepPct: number | null;
-  remPct: number | null;
-} {
-  if (!samples.length) return { durationMin: null, efficiency: null, deepPct: null, remPct: null };
-
-  let totalMin = 0, deepMin = 0, remMin = 0, awakeMin = 0;
-
-  for (const s of samples) {
-    const dur = (new Date(s.endDate).getTime() - new Date(s.startDate).getTime()) / 60000;
-    const value = s.value?.toLowerCase() ?? '';
-    if (value.includes('deep'))   { deepMin += dur; totalMin += dur; }
-    else if (value.includes('rem')) { remMin += dur; totalMin += dur; }
-    else if (value.includes('awake')) { awakeMin += dur; }
-    else if (value.includes('asleep') || value.includes('core')) { totalMin += dur; }
-  }
-
-  if (totalMin === 0) return { durationMin: null, efficiency: null, deepPct: null, remPct: null };
-
-  const efficiency = totalMin > 0 ? Math.round((totalMin / (totalMin + awakeMin)) * 100) : null;
-  const deepPct    = Math.round((deepMin / totalMin) * 100);
-  const remPct     = Math.round((remMin / totalMin) * 100);
-
-  return {
-    durationMin: Math.round(totalMin),
-    efficiency,
-    deepPct,
-    remPct,
-  };
-}
-
-function inferPeriodPhaseFromFlow(samples: any[]): string | null {
-  // Apple Health menstrual flow: 1=none, 2=light, 3=medium, 4=heavy
-  const latest = samples[samples.length - 1];
-  const flowValue = latest?.value ?? 1;
-  if (flowValue >= 2) return 'menstrual';
-  // Without cycle day tracking, we can't infer other phases from flow alone
-  return null;
-}
-
-// ─── Android Health Connect implementation ────────────────────────────────────
-
-async function syncAndroid(): Promise<void> {
-  let HealthConnect: ReturnType<typeof getHealthConnect>;
-  try {
-    HealthConnect = getHealthConnect();
-  } catch {
-    console.log('react-native-health-connect not available. Skipping health sync.');
-    return;
-  }
-
-  const { isAvailable } = await HealthConnect.initialize();
-  if (!isAvailable) { console.log('Health Connect not available on this device.'); return; }
-
-  const granted = await HealthConnect.requestPermission(
-    ANDROID_RECORD_TYPES.map((type) => ({ accessType: 'read', recordType: type })),
-  );
-
-  if (!granted) { console.log('Health Connect permissions denied.'); return; }
-
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
-
-  for (const date of [yesterday, today]) {
-    await syncAndroidForDate(HealthConnect, date);
-  }
-}
-
-async function syncAndroidForDate(
-  HealthConnect: ReturnType<typeof getHealthConnect>,
-  date: Date,
-): Promise<void> {
-  const dateStr = date.toISOString().slice(0, 10);
-  const timeRangeFilter = {
-    operator: 'between' as const,
-    startTime: dateStr + 'T00:00:00Z',
-    endTime: dateStr + 'T23:59:59Z',
-  };
-
-  const [hrvRecords, hrRecords, sleepRecords, periodRecords] = await Promise.all([
-    HealthConnect.readRecords('HeartRateVariabilityRmssdRecord', { timeRangeFilter }).catch(() => ({ records: [] })),
-    HealthConnect.readRecords('RestingHeartRateRecord', { timeRangeFilter }).catch(() => ({ records: [] })),
-    HealthConnect.readRecords('SleepSessionRecord', { timeRangeFilter }).catch(() => ({ records: [] })),
-    HealthConnect.readRecords('MenstruationFlowRecord', { timeRangeFilter }).catch(() => ({ records: [] })),
+  const [recovery, sleep] = await Promise.all([
+    owGet<{ items: OWRecoverySummary[] }>(
+      `${OW_HOST}/api/v1/users/${userId}/summaries/recovery?start_date=${date}&end_date=${date}`,
+      headers,
+    ),
+    owGet<{ items: OWSleepSummary[] }>(
+      `${OW_HOST}/api/v1/users/${userId}/summaries/sleep?start_date=${date}&end_date=${date}`,
+      headers,
+    ),
   ]);
 
-  const latestHrv = (hrvRecords.records as any[])[0]?.heartRateVariabilityMillis ?? null;
-  const latestHr  = (hrRecords.records as any[])[0]?.beatsPerMinute ?? null;
-  const sleepData = parseAndroidSleep((sleepRecords.records as any[]) ?? []);
-  const periodPhase = parsePeriodAndroid((periodRecords.records as any[]) ?? []);
+  const r = recovery?.items?.[0];
+  const s = sleep?.items?.[0];
+  if (!r && !s) return null;
 
-  const payload = {
-    date: dateStr,
-    sleep_duration_min: sleepData.durationMin,
-    sleep_efficiency: sleepData.efficiency,
-    deep_sleep_pct: sleepData.deepPct,
-    rem_sleep_pct: sleepData.remPct,
-    hrv_ms: latestHrv,
-    resting_hr: latestHr,
-    period_phase: periodPhase,
-    source: 'health_connect' as const,
-  };
-
-  await postHealthSync(payload);
-}
-
-function parseAndroidSleep(records: any[]): {
-  durationMin: number | null;
-  efficiency: number | null;
-  deepPct: number | null;
-  remPct: number | null;
-} {
-  if (!records.length) return { durationMin: null, efficiency: null, deepPct: null, remPct: null };
-
-  let totalMin = 0, deepMin = 0, remMin = 0, awakeMin = 0;
-
-  for (const session of records) {
-    const sessionDur = (new Date(session.endTime).getTime() - new Date(session.startTime).getTime()) / 60000;
-    totalMin += sessionDur;
-
-    for (const stage of (session.stages ?? [])) {
-      const dur = (new Date(stage.endTime).getTime() - new Date(stage.startTime).getTime()) / 60000;
-      // Health Connect sleep stage types: 1=AWAKE, 2=SLEEP_LIGHT, 3=SLEEP_DEEP, 4=SLEEP_REM, 5=SLEEP_UNKNOWN, 6=OUT_OF_BED
-      if (stage.stage === 3)  deepMin += dur;
-      if (stage.stage === 4)  remMin  += dur;
-      if (stage.stage === 1 || stage.stage === 6)  awakeMin += dur;
-    }
-  }
-
-  if (totalMin === 0) return { durationMin: null, efficiency: null, deepPct: null, remPct: null };
-
-  const asleepMin  = totalMin - awakeMin;
-  const efficiency = totalMin > 0 ? Math.round((asleepMin / totalMin) * 100) : null;
+  const stages = s?.stages as Record<string, number> | undefined;
 
   return {
-    durationMin: Math.round(asleepMin),
-    efficiency,
-    deepPct: asleepMin > 0 ? Math.round((deepMin / asleepMin) * 100) : null,
-    remPct:  asleepMin > 0 ? Math.round((remMin / asleepMin) * 100) : null,
+    hrv_ms:             r?.avg_hrv_sdnn_ms ?? null,
+    resting_hr:         r?.resting_heart_rate_bpm ?? null,
+    spo2:               r?.avg_spo2_percent ?? s?.avg_spo2_percent ?? null,
+    sleep_duration_min: s?.duration_minutes ?? null,
+    sleep_efficiency:   s?.efficiency_percent ?? null,
+    deep_sleep_pct:     stages?.deep != null ? stages.deep / (s!.duration_minutes! * 60) * 100 : null,
+    rem_sleep_pct:      stages?.rem  != null ? stages.rem  / (s!.duration_minutes! * 60) * 100 : null,
+    source:             (Platform.OS === 'ios' ? 'healthkit' : 'health_connect') as 'healthkit' | 'health_connect',
   };
 }
 
-function parsePeriodAndroid(records: any[]): string | null {
-  if (!records.length) return null;
-  const latest = records[records.length - 1];
-  // Health Connect flow types: 0=UNKNOWN, 1=NONE, 2=LIGHT, 3=MEDIUM, 4=HEAVY
-  return (latest.flow ?? 0) >= 2 ? 'menstrual' : null;
+async function owGet<T>(url: string, headers: Record<string, string>): Promise<T | null> {
+  try {
+    const res = await fetch(url, { headers });
+    if (!res.ok) return null;
+    return res.json() as Promise<T>;
+  } catch {
+    return null;
+  }
 }
 
-// ─── Shared POST helper ───────────────────────────────────────────────────────
+interface OWRecoverySummary {
+  date: string;
+  resting_heart_rate_bpm?: number;
+  avg_hrv_sdnn_ms?: number;
+  avg_spo2_percent?: number;
+  recovery_score?: number;
+}
+
+interface OWSleepSummary {
+  date: string;
+  duration_minutes?: number;
+  efficiency_percent?: number;
+  stages?: unknown;
+  avg_hrv_sdnn_ms?: number;
+  avg_spo2_percent?: number;
+}
 
 async function postHealthSync(payload: Record<string, unknown>): Promise<void> {
-  // Skip if all biometric values are null (no data available)
-  const hasData = Object.entries(payload).some(([k, v]) =>
-    k !== 'date' && k !== 'source' && v != null,
+  const hasData = Object.entries(payload).some(
+    ([k, v]) => k !== 'date' && k !== 'source' && v != null,
   );
   if (!hasData) return;
 
@@ -346,7 +189,6 @@ async function postHealthSync(payload: Record<string, unknown>): Promise<void> {
   });
 
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`health-sync failed: ${err}`);
+    throw new Error(`health-sync failed: ${await res.text()}`);
   }
 }

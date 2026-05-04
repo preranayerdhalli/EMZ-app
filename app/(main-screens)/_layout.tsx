@@ -1,5 +1,5 @@
 import { Tabs } from 'expo-router';
-import { View, Text, StyleSheet, AppState } from 'react-native';
+import { View, Text, StyleSheet, AppState, Platform } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -8,7 +8,6 @@ import { AppBackground } from '@/components/AuthBackground';
 import { AnimatedTabBarButton } from '@/components/AnimatedTabBarButton';
 import { ChatProvider } from '@/context/ChatContext';
 import { palette, colors, spacing, borderRadius, fonts, cardShadow } from '@/constants/theme';
-import { syncHealthData } from '@/services/health';
 import { syncAppleCalendar } from '@/services/calendar';
 
 const TAB_ICONS: Record<string, keyof typeof Ionicons.glyphMap> = {
@@ -37,21 +36,21 @@ export default function MainScreensLayout() {
   const insets = useSafeAreaInsets();
   const appState = useRef(AppState.currentState);
 
-  // Sync health + Apple calendar when app comes to foreground
+  // Sync Apple calendar on foreground (iOS only).
+  // Health sync is handled by backgroundSync.ts via subscribeToForegroundSync().
   useEffect(() => {
-    // Initial sync on mount
-    syncHealthData();
-    syncAppleCalendar();
+    if (Platform.OS !== 'ios') return;
+    syncAppleCalendar().catch(() => {});
 
     const sub = AppState.addEventListener('change', (nextState) => {
       if (appState.current.match(/inactive|background/) && nextState === 'active') {
-        syncHealthData();
-        syncAppleCalendar();
+        syncAppleCalendar().catch(() => {});
       }
       appState.current = nextState;
     });
     return () => sub.remove();
   }, []);
+
   const headerBarHeight = 44;
   const tabBarContentHeight = 64;
 

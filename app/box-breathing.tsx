@@ -13,6 +13,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useLocalSearchParams, router } from 'expo-router';
+import { usePostHog } from 'posthog-react-native';
 import { fonts } from '@/constants/theme';
 
 // ─── Sizing ───────────────────────────────────────────────────────────────────
@@ -48,6 +49,7 @@ const IDLE_GLOW = '#FF9500';
 export default function BoxBreathingScreen() {
   const { intent = 'Release tension, reset your mind' } = useLocalSearchParams<{ intent?: string }>();
 
+  const posthog = usePostHog();
   const [running,   setRunning]   = useState(false);
   const [phaseIdx,  setPhaseIdx]  = useState<0 | 1 | 2 | 3>(0);
   const [countdown, setCountdown] = useState(4);
@@ -144,6 +146,7 @@ export default function BoxBreathingScreen() {
 
   // ── Start ────────────────────────────────────────────────────────────────────
   const startBreathing = useCallback(() => {
+    posthog?.capture('breathing_started', { intent });
     totalRef.current = 0;
     runningRef.current = true;
     setRunning(true);

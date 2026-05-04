@@ -20,11 +20,13 @@ interface HealthPayload {
   rem_sleep_pct?: number;     // 0-100
   hrv_ms?: number;
   resting_hr?: number;
+  spo2?: number;              // blood oxygen saturation %
+  skin_temperature?: number;  // surface temp in °C (Samsung sensor only)
   recovery_score?: number;    // 0-100
   body_battery_am?: number;   // 0-100
   period_phase?: 'follicular' | 'ovulatory' | 'luteal' | 'menstrual' | null;
   period_day?: number | null;
-  source: 'healthkit' | 'health_connect' | 'manual';
+  source: 'healthkit' | 'health_connect' | 'samsung_sensor' | 'manual';
 }
 
 serve(async (req) => {
@@ -80,6 +82,8 @@ serve(async (req) => {
       hrv_ms: payload.hrv_ms ?? null,
       hrv_7day_avg: hrv7DayAvg,
       resting_hr: payload.resting_hr ?? null,
+      spo2: payload.spo2 ?? null,
+      skin_temperature: payload.skin_temperature ?? null,
       recovery_score: payload.recovery_score ?? null,
       body_battery_am: payload.body_battery_am ?? null,
       source: payload.source,

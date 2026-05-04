@@ -4,27 +4,24 @@
     "slug": "emz",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/logo.png",
+    "icon": "./assets/images/bee.png",
     "scheme": "emz",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
+    "backgroundColor": "#F4EFCF",
     "splash": {
-      "image": "./assets/images/logo.png",
+      "image": "./assets/images/bee.png",
       "resizeMode": "contain",
-      "backgroundColor": "#FFFFFF"
+      "backgroundColor": "#F4EFCF"
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.emz.app",
-      "infoPlist": {
-        "NSHealthShareUsageDescription": "EMZ reads your health data to calculate your energy levels and recovery.",
-        "NSHealthUpdateUsageDescription": "EMZ reads your health data to calculate your energy levels and recovery."
-      }
+      "bundleIdentifier": "com.emz.app"
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/images/logo.png",
-        "backgroundColor": "#FFFFFF"
+        "foregroundImage": "./assets/images/bee.png",
+        "backgroundColor": "#F4EFCF"
       },
       "package": "com.emz.app",
       "minSdkVersion": 26,
@@ -34,10 +31,19 @@
         "android.permission.health.READ_HEART_RATE_VARIABILITY",
         "android.permission.health.READ_RESTING_HEART_RATE",
         "android.permission.health.READ_MENSTRUATION",
-        "android.permission.health.READ_EXERCISE"
+        "android.permission.health.READ_EXERCISE",
+        "android.permission.health.READ_OXYGEN_SATURATION"
       ]
     },
     "plugins": [
+      [
+        "open-wearables",
+        {
+          "healthShareUsage": "EMZ reads your health data to calculate your energy levels and recovery.",
+          "healthUpdateUsage": "EMZ reads your health data to calculate your energy levels and recovery."
+        }
+      ],
+      "./plugins/withMavenLocal",
       "expo-router",
       "expo-asset",
       "expo-font",
@@ -52,9 +58,9 @@
         }
       ],
       [
-        "react-native-health-connect",
+        "@react-native-google-signin/google-signin",
         {
-          "package": "com.emz.app"
+          "iosUrlScheme": "com.googleusercontent.apps.933912268834-354usg5oqgk44pt3e543hcgenr17hj02"
         }
       ]
     ],

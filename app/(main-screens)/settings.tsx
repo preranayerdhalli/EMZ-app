@@ -16,6 +16,8 @@ import {
   Keyboard,
   Animated,
   Easing,
+  Alert,
+  Linking,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -26,6 +28,15 @@ import { ScreenHeaderTitle } from '@/components/ScreenHeader';
 import { Card, ListRow } from '@/components/ui';
 import { colors, borderRadius, typography, fonts, palette, cardShadow } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
+import { db, supabase } from '@/services/supabase';
+import {
+  connectGoogleCalendar,
+  syncAppleCalendar,
+  connectMicrosoftCalendar,
+  disconnectCalendar,
+  getConnectedCalendars,
+} from '@/services/calendar';
+import { syncHealthData } from '@/services/health';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -83,14 +94,11 @@ type ConnectOption = {
 };
 
 const WEARABLE_OPTIONS: ConnectOption[] = [
-  { id: 'apple-health', name: 'Apple Health',  icon: 'heart',           iconColor: '#FF3B5C', iconBg: 'rgba(255,59,92,0.10)'  },
-  { id: 'google-fit',   name: 'Google Fit',    icon: 'fitness-outline', iconColor: '#4285F4', iconBg: 'rgba(66,133,244,0.10)' },
   { id: 'samsung',      name: 'Samsung Health',icon: 'heart-outline',   iconColor: '#1428A0', iconBg: 'rgba(20,40,160,0.10)'  },
 ];
 
 const CALENDAR_OPTIONS: ConnectOption[] = [
   { id: 'google-cal', name: 'Google Calendar', icon: 'logo-google',  iconColor: '#4285F4', iconBg: 'rgba(66,133,244,0.10)' },
-  { id: 'apple-cal',  name: 'Apple Calendar',  icon: 'logo-apple',   iconColor: INK,       iconBg: 'rgba(46,46,46,0.06)'   },
   { id: 'outlook',    name: 'Outlook',          icon: 'mail-outline', iconColor: '#0078D4', iconBg: 'rgba(0,120,212,0.10)'  },
 ];
 
@@ -186,7 +194,17 @@ const ERASE_ITEMS = [
   { icon: 'settings-outline'       as const, label: 'Preferences & settings'   },
 ];
 
-function ResetDataModal({ visible, onClose }: { visible: boolean; onClose: () => void }) {
+function ResetDataModal({
+  visible,
+  onClose,
+  onReset,
+  userEmail,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  onReset: () => Promise<void>;
+  userEmail?: string;
+}) {
   const [email, setEmail]       = useState('');
   const [deleted, setDeleted]   = useState(false);
   const shakeAnim  = useRef(new Animated.Value(0)).current;
@@ -221,11 +239,18 @@ function ResetDataModal({ visible, onClose }: { visible: boolean; onClose: () =>
     ]).start();
   };
 
-  const handleDelete = () => {
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (closeTimerRef.current) clearTimeout(closeTimerRef.current); }, []);
+
+  const handleDelete = async () => {
     if (!email.trim()) { shake(); return; }
+    if (userEmail && email.trim().toLowerCase() !== userEmail.trim().toLowerCase()) {
+      shake();
+      return;
+    }
     setDeleted(true);
-    // TODO: wire to actual data-reset logic
-    setTimeout(() => { onClose(); }, 1800);
+    try { await onReset(); } catch { /* signOut navigates away — ignore */ }
+    closeTimerRef.current = setTimeout(onClose, 1800);
   };
 
   const canDelete = email.trim().length > 0;
@@ -636,17 +661,13 @@ function ProfileEditModal({ visible, name, email, onSave, onClose }: ProfileEdit
           </View>
 
           {/* Avatar */}
-          <Pressable style={pmStyles.avatarWrap} onPress={() => {}}>
+          <View style={pmStyles.avatarWrap}>
             <View style={pmStyles.avatar}>
               <Text style={pmStyles.avatarInitial}>
                 {draftName.trim().charAt(0).toUpperCase() || 'P'}
               </Text>
             </View>
-            <View style={pmStyles.cameraChip}>
-              <Ionicons name="camera" size={13} color="#fff" />
-            </View>
-          </Pressable>
-          <Text style={pmStyles.photoHint}>Tap to change photo</Text>
+          </View>
 
           {/* Fields */}
           <View style={pmStyles.fields}>
@@ -732,7 +753,7 @@ const pmStyles = StyleSheet.create({
   },
   avatarWrap: {
     alignSelf: 'center',
-    marginBottom: 6,
+    marginBottom: 24,
   },
   avatar: {
     width: 72,
@@ -806,10 +827,21 @@ const pmStyles = StyleSheet.create({
 
 // ─── Screen ────────────────────────────────────────────────────────────────────
 
+type SettingsCalendarId = 'google-cal' | 'apple-cal' | 'outlook';
+type SettingsWearableId = 'apple-health' | 'samsung';
+
+const CALENDAR_ID_TO_PROVIDER: Record<SettingsCalendarId, 'google' | 'microsoft' | 'apple'> = {
+  'google-cal': 'google',
+  'outlook': 'microsoft',
+  'apple-cal': 'apple',
+};
+
+const COMING_SOON_IDS = new Set<SettingsCalendarId | SettingsWearableId>(['outlook']);
+
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
-  const { signOut } = useAuth();
+  const { signOut, user } = useAuth();
 
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -817,7 +849,7 @@ export default function SettingsScreen() {
     });
   }, [navigation]);
 
-  const [profileName, setProfileName] = useState('Pre');
+  const [profileName, setProfileName] = useState('');
   const [profileEmail, setProfileEmail] = useState('');
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [selectedTheme, setSelectedTheme] = useState<ThemeMode>('light');
@@ -829,18 +861,96 @@ export default function SettingsScreen() {
   const [connectedIds,   setConnectedIds]   = useState<Set<string>>(new Set());
   const [resetModalOpen, setResetModalOpen] = useState(false);
 
-  const toggleConnection = (id: string) => {
-    setConnectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
+  // user?.id is stable; avoids re-running on unrelated auth events
+  useEffect(() => {
+    if (!user) return;
+    setProfileEmail(user.email ?? '');
+    const meta = user.user_metadata as Record<string, unknown> | undefined;
+    const name = (meta?.full_name ?? meta?.name ?? '') as string;
+    setProfileName(name || (user.email ?? '').split('@')[0]);
+  }, [user?.id]);
+
+  useEffect(() => {
+    const load = async () => {
+      const ids = new Set<string>();
+      const providers = await getConnectedCalendars().catch(() => new Set<string>());
+      if (providers.has('google'))    ids.add('google-cal');
+      if (providers.has('microsoft')) ids.add('outlook');
+      if (providers.has('apple'))     ids.add('apple-cal');
+      if (Platform.OS === 'ios')      ids.add('apple-health');
+      if (Platform.OS === 'android') ids.add('health-connect');
+      setConnectedIds(ids);
+    };
+    load();
+  }, [user?.id]);
+
+  const toggleCalendarConnection = async (id: SettingsCalendarId) => {
+    if (COMING_SOON_IDS.has(id)) {
+      Alert.alert('Coming Soon', 'This integration will be available in a future update.');
+      return;
+    }
+    const provider = CALENDAR_ID_TO_PROVIDER[id];
+    if (connectedIds.has(id)) {
+      await disconnectCalendar(provider);
+      setConnectedIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
+      return;
+    }
+    if (id === 'google-cal') {
+      const ok = await connectGoogleCalendar();
+      if (ok) setConnectedIds((prev) => new Set(prev).add(id));
+    } else if (id === 'apple-cal') {
+      await syncAppleCalendar();
+      setConnectedIds((prev) => new Set(prev).add(id));
+    }
+  };
+
+  const toggleWearableConnection = async (id: SettingsWearableId) => {
+    if (COMING_SOON_IDS.has(id)) {
+      Alert.alert('Coming Soon', 'This integration will be available in a future update.');
+      return;
+    }
+    if (connectedIds.has(id)) {
+      setConnectedIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
+    } else {
+      await syncHealthData();
+      setConnectedIds((prev) => new Set(prev).add(id));
+    }
+  };
+
+  const handleProfileSave = async (n: string, _e: string) => {
+    setProfileName(n);
+    if (!user) return;
+    try {
+      await db.users().update({ full_name: n.trim() || null }).eq('id', user.id);
+      await supabase.auth.updateUser({ data: { full_name: n.trim() || null } });
+    } catch { /* Non-critical — local state already updated */ }
+  };
+
+  const handleResetData = async () => {
+    if (!user) return;
+    await Promise.all([
+      db.tasks().delete().eq('user_id', user.id),
+      db.moodCheckins().delete().eq('user_id', user.id),
+      db.biometricReadings().delete().eq('user_id', user.id),
+      db.energyForecasts().delete().eq('user_id', user.id),
+      db.calendarEvents().delete().eq('user_id', user.id),
+      db.calendarTokens().delete().eq('user_id', user.id),
+      db.dailySummaries().delete().eq('user_id', user.id),
+    ]);
+    // Reset onboarding so user re-enters setup on next login
+    await db.userSettings()
+      .update({ onboarding_complete: false })
+      .eq('user_id', user.id);
+    await signOut();
   };
 
   const sw = {
     track: { false: 'rgba(46,46,46,0.10)', true: 'rgba(255,215,0,0.40)' },
     thumb: (on: boolean) => on ? colors.brandGold : 'rgba(46,46,46,0.28)',
   };
+
+  const displayName = profileName || profileEmail.split('@')[0];
+  const avatarInitial = displayName.charAt(0).toUpperCase() || 'E';
 
   return (
     <AppBackground>
@@ -859,11 +969,11 @@ export default function SettingsScreen() {
                 start={{ x: 0.2, y: 0 }}
                 end={{ x: 0.8, y: 1 }}
               >
-                <Text style={styles.avatarInitial}>{profileName.trim().charAt(0).toUpperCase() || 'P'}</Text>
+                <Text style={styles.avatarInitial}>{avatarInitial}</Text>
               </LinearGradient>
             </View>
             <View style={styles.profileNameColumn}>
-              <Text style={styles.profileName}>{profileName}</Text>
+              <Text style={styles.profileName}>{displayName}</Text>
               {profileEmail && <Text style={styles.profileEmail}>{profileEmail}</Text>}
             </View>
           </View>
@@ -892,7 +1002,7 @@ export default function SettingsScreen() {
             subtitle="Sync health & fitness data"
             options={WEARABLE_OPTIONS}
             connectedIds={connectedIds}
-            onToggle={toggleConnection}
+            onToggle={(id) => toggleWearableConnection(id as SettingsWearableId)}
           />
           <ExpandableConnect
             icon="calendar-outline"
@@ -902,7 +1012,7 @@ export default function SettingsScreen() {
             subtitle="Sync events & schedule"
             options={CALENDAR_OPTIONS}
             connectedIds={connectedIds}
-            onToggle={toggleConnection}
+            onToggle={(id) => toggleCalendarConnection(id as SettingsCalendarId)}
             showDivider={false}
           />
         </Card>
@@ -990,21 +1100,21 @@ export default function SettingsScreen() {
             iconBg="rgba(127,165,122,0.12)"
             iconColor="#7FA57A"
             title="Help & FAQ"
-            onPress={() => {}}
+            onPress={() => Alert.alert('Help & FAQ', 'Full FAQ coming soon. In the meantime, send us feedback and we\'ll reply directly.')}
           />
           <ListRow
             icon="chatbubble-ellipses-outline"
             iconBg="rgba(127,165,122,0.12)"
             iconColor="#7FA57A"
             title="Send Feedback"
-            onPress={() => {}}
+            onPress={() => Linking.openURL('mailto:infoemz.au@gmail.com?subject=EMZ%20Feedback')}
           />
           <ListRow
             icon="document-text-outline"
             iconBg="rgba(46,46,46,0.05)"
             iconColor={INK_SEC}
             title="Terms & Privacy Policy"
-            onPress={() => {}}
+            onPress={() => Alert.alert('Coming Soon', 'Terms and Privacy Policy will be available before public launch.')}
           />
           <ListRow
             icon="information-circle-outline"
@@ -1037,10 +1147,15 @@ export default function SettingsScreen() {
         visible={profileModalOpen}
         name={profileName}
         email={profileEmail}
-        onSave={(n, e) => { setProfileName(n); setProfileEmail(e); }}
+        onSave={handleProfileSave}
         onClose={() => setProfileModalOpen(false)}
       />
-      <ResetDataModal visible={resetModalOpen} onClose={() => setResetModalOpen(false)} />
+      <ResetDataModal
+        visible={resetModalOpen}
+        onClose={() => setResetModalOpen(false)}
+        onReset={handleResetData}
+        userEmail={profileEmail}
+      />
     </AppBackground>
   );
 }

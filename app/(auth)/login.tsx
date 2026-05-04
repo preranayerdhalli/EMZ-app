@@ -69,9 +69,12 @@ const HERO_CENTER_OFFSET = 140;
 
 export default function LoginScreen() {
   const router = useRouter();
-  const { signInWithEmail, signInWithGoogle, signInWithApple } = useAuth();
+  const { signInWithEmail, verifyOtp, signInWithGoogle, signInWithApple } = useAuth();
   const [email, setEmail] = useState('');
   const [sending, setSending] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [otp, setOtp] = useState('');
+  const [verifying, setVerifying] = useState(false);
 
   // Animation values
   const heroOpacity    = useRef(new Animated.Value(0)).current;
@@ -187,25 +190,54 @@ export default function LoginScreen() {
                     value={email}
                     onChangeText={setEmail}
                     autoComplete="email"
+                    editable={!otpSent}
                   />
                 </Animated.View>
+
+                {/* OTP input — shown after code is sent */}
+                {otpSent && (
+                  <GlassInput
+                    label="6-digit code"
+                    placeholder="123456"
+                    value={otp}
+                    onChangeText={(t) => setOtp(t.replace(/\D/g, '').slice(0, 6))}
+                    keyboardType="number-pad"
+                    autoComplete="one-time-code"
+                  />
+                )}
 
                 {/* Primary CTA */}
                 <Animated.View style={fadeUp(row1)}>
                   <Pressable
                     onPress={async () => {
-                      if (!email.trim()) {
-                        Alert.alert('Email required', 'Please enter your email address.');
-                        return;
-                      }
-                      setSending(true);
-                      try {
-                        await signInWithEmail(email);
-                        Alert.alert('Check your email', 'We sent you a magic link. Tap it to sign in.');
-                      } catch (e: any) {
-                        Alert.alert('Error', e.message ?? 'Could not send login link. Please try again.');
-                      } finally {
-                        setSending(false);
+                      if (!otpSent) {
+                        if (!email.trim()) {
+                          Alert.alert('Email required', 'Please enter your email address.');
+                          return;
+                        }
+                        setSending(true);
+                        try {
+                          await signInWithEmail(email);
+                          setOtpSent(true);
+                        } catch (e: any) {
+                          Alert.alert('Error', e.message ?? 'Could not send code. Please try again.');
+                        } finally {
+                          setSending(false);
+                        }
+                      } else {
+                        if (otp.length < 6) {
+                          Alert.alert('Code required', 'Please enter the 6-digit code from your email.');
+                          return;
+                        }
+                        setVerifying(true);
+                        try {
+                          await verifyOtp(email, otp);
+                          // AuthGuard handles navigation after session is set
+                        } catch (e: any) {
+                          Alert.alert('Invalid code', e.message ?? 'The code is incorrect or expired. Try resending.');
+                        } finally {
+                          setVerifying(false);
+                        }
                       }
                     }}
                     style={({ pressed }) => [styles.primaryBtn, pressed && styles.primaryBtnPressed]}
@@ -216,12 +248,40 @@ export default function LoginScreen() {
                       end={{ x: 0.9, y: 1 }}
                       style={StyleSheet.absoluteFill}
                     />
-                    {sending
+                    {(sending || verifying)
                       ? <ActivityIndicator color={palette.textPrimary} />
-                      : <Text style={styles.primaryBtnText}>Send login link</Text>
+                      : <Text style={styles.primaryBtnText}>{otpSent ? 'Verify code' : 'Send login code'}</Text>
                     }
                   </Pressable>
                 </Animated.View>
+
+                {/* Resend / change email */}
+                {otpSent && (
+                  <View style={styles.resendRow}>
+                    <Text style={styles.resendText}>Didn't get it? </Text>
+                    <Pressable
+                      hitSlop={8}
+                      onPress={async () => {
+                        setSending(true);
+                        try {
+                          await signInWithEmail(email);
+                          setOtp('');
+                          Alert.alert('Sent', 'A new code has been sent to your email.');
+                        } catch (e: any) {
+                          Alert.alert('Error', e.message ?? 'Could not resend.');
+                        } finally {
+                          setSending(false);
+                        }
+                      }}
+                    >
+                      <Text style={styles.resendLink}>Resend</Text>
+                    </Pressable>
+                    <Text style={styles.resendText}> · </Text>
+                    <Pressable hitSlop={8} onPress={() => { setOtpSent(false); setOtp(''); }}>
+                      <Text style={styles.resendLink}>Change email</Text>
+                    </Pressable>
+                  </View>
+                )}
 
                 {/* Divider */}
                 <Animated.View style={fadeUp(row2)}>
@@ -380,6 +440,24 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontFamily: fonts.bodyMedium,
     color: colors.ink.primary,
+  },
+
+  // Resend / change email row
+  resendRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+  },
+  resendText: {
+    color: colors.ink.tertiary,
+    fontSize: 13,
+    fontFamily: fonts.bodyRegular,
+  },
+  resendLink: {
+    color: palette.accentOrange,
+    fontSize: 13,
+    fontFamily: fonts.bodyMedium,
   },
 
   // Footer

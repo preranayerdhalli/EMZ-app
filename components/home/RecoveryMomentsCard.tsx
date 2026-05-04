@@ -105,7 +105,13 @@ function BreathingRow({ breath, suggestedTime, onPress }: BreathingRowProps) {
     <Animated.View style={{ transform: [{ scale }] }}>
       <Pressable style={styles.row} onPress={onPress} onPressIn={pressIn} onPressOut={pressOut}>
         <View style={styles.thumb}>
-          <Image source={require('../../assets/images/Music Icon.jpg')} style={StyleSheet.absoluteFill} />
+          <LinearGradient
+            colors={['#A8D5A2', '#6BAD9A']}
+            start={{ x: 0.1, y: 0 }}
+            end={{ x: 0.9, y: 1 }}
+            style={StyleSheet.absoluteFill}
+          />
+          <Ionicons name="leaf" size={22} color="rgba(255,255,255,0.92)" />
         </View>
 
         <View style={styles.rowInfo}>

@@ -26,12 +26,10 @@ emz/
 │   │   ├── login.tsx
 │   │   └── signup.tsx
 │   └── (main-screens)/    # Main app: tabs
-│       ├── _layout.tsx    # Tabs + AppBackground, ChatProvider, CalendarProvider
+│       ├── _layout.tsx    # Tabs + AppBackground, ChatProvider
 │       ├── index.tsx      # Home
-│       ├── calendar.tsx
-│       ├── progress.tsx
-│       ├── explorer.tsx
-│       └── settings.tsx
+│       ├── calendar.tsx   # Calendar + connected integrations
+│       └── settings.tsx   # User profile, calendars, wearables (no tab; opens from Home)
 │
 ├── components/            # Reusable UI
 │   ├── AuthBackground.tsx # App-wide gradient background
@@ -52,8 +50,8 @@ emz/
 │       └── ConnectedCalendarsSheet.tsx
 │
 ├── context/               # React context
-│   ├── ChatContext.tsx    # Chat sessions, messages, persistence
-│   └── CalendarItemsContext.tsx
+│   ├── AuthContext.tsx    # Session, user, Google/Apple OAuth, sign out
+│   └── ChatContext.tsx    # Chat sessions, messages, persistence
 │
 ├── constants/             # Design tokens & types
 │   ├── theme.ts           # colors, spacing, borderRadius, typography
@@ -79,6 +77,6 @@ emz/
 
 ## Design
 
-- **Tabs:** Home · Calendar · Progress · Explorer · Settings
+- **Tabs:** Home · Calendar (Settings accessible via profile icon on Home)
 - **Chat:** Opened from Home via the bee pull-up (`AnimationPullUp` → `BeeChat`).
 - **Theme:** Light-first; brand colours and glass-style surfaces (see `constants/theme.ts` and `.cursor/rules/`).
