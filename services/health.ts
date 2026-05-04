@@ -2,41 +2,55 @@
  * services/health.ts
  *
  * Health data sync via Open Wearables SDK.
- * Replaces the previous react-native-health (HealthKit), react-native-health-connect,
- * and Samsung Health Sensor SDK integrations.
  *
  * Architecture:
- *   Open Wearables SDK ─► OW Server (Docker) ─► Supabase health-sync
+ *   Open Wearables SDK ─► OW Server (Railway) ─► Supabase health-sync
  *
- * Required env vars:
- *   EXPO_PUBLIC_OW_HOST     — base URL of your OW server, e.g. https://ow.yourapp.com
- *   EXPO_PUBLIC_OW_API_KEY  — API key created in the OW developer portal
- *
- * Android prerequisite: publish the OW Android SDK to Maven Local before building:
- *   git clone https://github.com/the-momentum/open_wearables_android_sdk
- *   cd open_wearables_android_sdk && git checkout v0.6.0
- *   ./gradlew publishToMavenLocal
- *
- * Requires a dev build (expo prebuild + expo run:ios / run:android).
+ * The native Open Wearables Android SDK (com.openwearables.health:sdk) must be
+ * bundled as a local AAR in android-libs/ so EAS cloud builds can resolve it.
+ * See plugins/withLocalAar.js and the bundled AAR at android-libs/ow-sdk-0.6.0.aar.
  */
 
-import OpenWearablesSDK, { HealthDataType } from 'open-wearables';
 import { Platform } from 'react-native';
 import { supabase } from '@/services/supabase';
 
 const OW_HOST = process.env.EXPO_PUBLIC_OW_HOST ?? '';
 const OW_API_KEY = process.env.EXPO_PUBLIC_OW_API_KEY ?? '';
 
-// Configure SDK once at module load — safe to call before sign-in
-OpenWearablesSDK.configure(OW_HOST);
+// Lazy-load the native SDK so a missing native module never crashes the app.
+// On EAS builds where the AAR wasn't resolved, SDK calls silently no-op.
+type OWSDKType = typeof import('open-wearables').default;
+type HealthDataTypeEnum = typeof import('open-wearables').HealthDataType;
 
-const HEALTH_TYPES: HealthDataType[] = [
-  HealthDataType.HeartRateVariabilitySDNN,
-  HealthDataType.RestingHeartRate,
-  HealthDataType.OxygenSaturation,
-  HealthDataType.Sleep,
-  HealthDataType.MenstrualFlow,
-];
+let _sdk: OWSDKType | null = null;
+let _HealthDataType: HealthDataTypeEnum | null = null;
+let _configured = false;
+
+function getSDK(): OWSDKType | null {
+  if (_sdk !== null) return _sdk;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('open-wearables');
+    _sdk = mod.default;
+    _HealthDataType = mod.HealthDataType;
+  } catch {
+    // Native module not available — health sync disabled for this build
+  }
+  return _sdk;
+}
+
+function getHealthTypes(): string[] {
+  const sdk = getSDK();
+  if (!sdk || !_HealthDataType) return [];
+  const T = _HealthDataType;
+  return [
+    T.HeartRateVariabilitySDNN,
+    T.RestingHeartRate,
+    T.OxygenSaturation,
+    T.Sleep,
+    T.MenstrualFlow,
+  ];
+}
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -46,8 +60,14 @@ const HEALTH_TYPES: HealthDataType[] = [
  */
 export async function initHealthSDK(userId: string): Promise<void> {
   try {
-    await OpenWearablesSDK.signIn(userId, null, null, OW_API_KEY);
-    await OpenWearablesSDK.requestAuthorization(HEALTH_TYPES);
+    const sdk = getSDK();
+    if (!sdk) return;
+    if (!_configured) {
+      sdk.configure(OW_HOST);
+      _configured = true;
+    }
+    await sdk.signIn(userId, null, null, OW_API_KEY);
+    await sdk.requestAuthorization(getHealthTypes());
   } catch (err) {
     console.warn('[health] initHealthSDK failed:', err);
   }
@@ -57,13 +77,12 @@ export async function initHealthSDK(userId: string): Promise<void> {
  * Trigger an immediate sync: OW SDK reads from HealthKit / Health Connect /
  * Samsung Health and pushes to the OW server, then we forward the daily
  * summary to the Supabase health-sync edge function.
- *
- * Safe to call on foreground — non-throwing.
  */
 export async function syncHealthData(): Promise<void> {
   try {
-    if (!OpenWearablesSDK.isSessionValid()) return;
-    await OpenWearablesSDK.syncNow();
+    const sdk = getSDK();
+    if (!sdk || !sdk.isSessionValid()) return;
+    await sdk.syncNow();
     await forwardOWDataToSupabase();
   } catch (err) {
     console.warn('[health] syncHealthData failed:', err);
@@ -76,8 +95,9 @@ export async function syncHealthData(): Promise<void> {
  */
 export async function startHealthBackgroundSync(): Promise<void> {
   try {
-    if (!OpenWearablesSDK.isSessionValid()) return;
-    await OpenWearablesSDK.startBackgroundSync(7); // sync up to 7 days back
+    const sdk = getSDK();
+    if (!sdk || !sdk.isSessionValid()) return;
+    await sdk.startBackgroundSync(7);
   } catch (err) {
     console.warn('[health] startBackgroundSync failed:', err);
   }
@@ -87,7 +107,7 @@ export async function startHealthBackgroundSync(): Promise<void> {
  * Call on Supabase sign-out to clear the OW SDK session.
  */
 export function signOutHealthSDK(): void {
-  OpenWearablesSDK.signOut().catch(() => {});
+  getSDK()?.signOut().catch(() => {});
 }
 
 // ─── OW server → Supabase forwarding ─────────────────────────────────────────

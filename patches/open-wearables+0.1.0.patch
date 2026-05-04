@@ -1,0 +1,13 @@
+diff --git a/node_modules/open-wearables/android/build.gradle b/node_modules/open-wearables/android/build.gradle
+index 146f49b..7122cfc 100644
+--- a/node_modules/open-wearables/android/build.gradle
++++ b/node_modules/open-wearables/android/build.gradle
+@@ -23,5 +23,6 @@ repositories {
+ }
+ 
+ dependencies {
+-    implementation("com.openwearables.health:sdk:0.6.0")
++    // Local AARs bundled in android-libs/ — resolves without Maven Local or JitPack on EAS
++    implementation(fileTree(dir: "${rootProject.projectDir}/../android-libs", include: ['*.aar']))
+ }
+\ No newline at end of file
